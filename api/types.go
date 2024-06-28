@@ -171,6 +171,7 @@ type Runner struct {
 	UseMMap   TriState `json:"use_mmap,omitempty"`
 	UseMLock  bool     `json:"use_mlock,omitempty"`
 	NumThread int      `json:"num_thread,omitempty"`
+	OverrideKV []string `json:"override_kv,omitempty"`
 }
 
 type TriState int

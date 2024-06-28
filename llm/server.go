@@ -188,6 +188,12 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		params = append(params, "--mmproj", projectors[0])
 	}
 
+        if len(opts.OverrideKV) > 0 {
+                for _, override := range opts.OverrideKV {
+                      params = append(params, "--override-kv", override)
+                }
+        }
+
 	if opts.NumThread > 0 {
 		params = append(params, "--threads", fmt.Sprintf("%d", opts.NumThread))
 	}
