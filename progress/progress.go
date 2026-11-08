@@ -25,6 +25,11 @@ type Progress struct {
 	// buffer output to minimize flickering on all terminals
 	w *bufio.Writer
 
+	// isTerminal reports whether the output writer is an interactive
+	// terminal. ANSI cursor hide/show and synchronized-output sequences are
+	// only emitted when this is true, so redirected stderr is not polluted.
+	isTerminal bool
+
 	pos int
 
 	states []State
@@ -38,7 +43,11 @@ type Progress struct {
 }
 
 func NewProgress(w io.Writer) *Progress {
-	p := &Progress{w: bufio.NewWriter(w), done: make(chan struct{}), loopDone: make(chan struct{})}
+	isTerminal := false
+	if f, ok := w.(*os.File); ok {
+		isTerminal = term.IsTerminal(int(f.Fd()))
+	}
+	p := &Progress{w: bufio.NewWriter(w), isTerminal: isTerminal, done: make(chan struct{}), loopDone: make(chan struct{})}
 	go p.start()
 	return p
 }
@@ -83,8 +92,10 @@ func (p *Progress) StopAndClear() bool {
 	stopped, pos := p.stop()
 	defer p.w.Flush()
 
-	fmt.Fprint(p.w, "\033[?25l")
-	defer fmt.Fprint(p.w, "\033[?25h")
+	if p.isTerminal {
+		fmt.Fprint(p.w, "\033[?25l")
+		defer fmt.Fprint(p.w, "\033[?25h")
+	}
 
 	if stopped {
 		// clear all progress lines
@@ -115,12 +126,19 @@ func (p *Progress) render() {
 
 // renderLocked renders with p.mu held.
 func (p *Progress) renderLocked() {
+	defer p.w.Flush()
+
+	// When the output is not an interactive terminal there is nothing to
+	// animate: skip the render entirely so redirected stderr receives no
+	// spinner frames or cursor-control escape sequences.
+	if !p.isTerminal {
+		return
+	}
+
 	_, termHeight, err := term.GetSize(int(os.Stderr.Fd()))
 	if err != nil {
 		termHeight = defaultTermHeight
 	}
-
-	defer p.w.Flush()
 
 	// eliminate flickering on terminals that support synchronized output
 	fmt.Fprint(p.w, "\033[?2026h")

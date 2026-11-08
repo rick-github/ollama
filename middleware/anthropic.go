@@ -95,7 +95,9 @@ func (w *AnthropicWriter) Write(data []byte) (int, error) {
 	if code != http.StatusOK {
 		return w.writeError(data)
 	}
-
+	if w.stream && isHeartbeat(data) {
+		return w.writeSSEHeartbeat()
+	}
 	return w.writeResponse(data)
 }
 
@@ -162,6 +164,10 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	code := w.Status()
 	if code != http.StatusOK {
 		return w.inner.writeError(data)
+	}
+
+	if w.stream && isHeartbeat(data) {
+		return w.writeSSEHeartbeat()
 	}
 
 	var chunk struct {

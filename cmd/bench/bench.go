@@ -47,6 +47,9 @@ type flagOptions struct {
 	decisionMode *string
 	decisionURL  *string
 	concurrency  *int
+	perplexity   *bool
+	kldReference *string
+	kldTopK      *int
 }
 
 type Metrics struct {
@@ -65,6 +68,26 @@ type ModelInfo struct {
 	SizeBytes         int64
 	VRAMBytes         int64
 	NumCtx            int64
+}
+
+// KLDPosition stores the logprobs for a single token position.
+type KLDPosition struct {
+	Token       string         `json:"token"`
+	Logprob     float64        `json:"logprob"`
+	TopLogprobs []KLDTokenProb `json:"top_logprobs"`
+}
+
+// KLDTokenProb is a token-logprob pair for JSON serialization.
+type KLDTokenProb struct {
+	Token   string  `json:"token"`
+	Logprob float64 `json:"logprob"`
+}
+
+// KLDReference is the saved reference distribution from pass 1.
+type KLDReference struct {
+	Model     string        `json:"model"`
+	Prompt    string        `json:"prompt"`
+	Positions []KLDPosition `json:"positions"`
 }
 
 const DefaultPrompt = `Please write a descriptive story about a llama named Alonso who grows up to be President of the Land of Llamas. Include details about Alonso's childhood, adolescent years, and how he grew up to be a political mover and shaker. Write the story with a sense of whimsy.`
@@ -284,12 +307,20 @@ func buildChatRequest(model string, fOpt flagOptions, imgData api.ImageData, var
 		msg.Images = []api.ImageData{imgData}
 	}
 
-	return &api.ChatRequest{
+	req := &api.ChatRequest{
 		Model:     model,
 		Messages:  []api.Message{msg},
+		Logprobs:  fOpt.perplexity != nil && *fOpt.perplexity,
 		Options:   benchmarkOptions(fOpt),
 		KeepAlive: benchmarkKeepAlive(fOpt),
 	}
+
+	if fOpt.kldReference != nil && *fOpt.kldReference != "" {
+		req.Logprobs = true
+		req.TopLogprobs = *fOpt.kldTopK
+	}
+
+	return req
 }
 
 // maxPadTokens caps the filler a plan may carry. Past this the prompt says more
@@ -494,7 +525,7 @@ func fetchContextLength(ctx context.Context, client *api.Client, model string) i
 	return 0
 }
 
-func outputFormatHeader(w io.Writer, format string, verbose bool) {
+func outputFormatHeader(w io.Writer, format string, verbose bool, includePpl bool, includeKld bool) {
 	switch format {
 	case "benchstat":
 		if verbose {
@@ -503,6 +534,12 @@ func outputFormatHeader(w io.Writer, format string, verbose bool) {
 		}
 	case "csv":
 		headings := []string{"NAME", "STEP", "COUNT", "NS_PER_COUNT", "TOKEN_PER_SEC", "CACHED_PROMPT_COUNT"}
+		if includePpl {
+			headings = append(headings, "PERPLEXITY")
+		}
+		if includeKld {
+			headings = append(headings, "KLD")
+		}
 		fmt.Fprintln(w, strings.Join(headings, ","))
 	}
 }
@@ -529,7 +566,7 @@ func isRateStep(step string) bool {
 	return strings.HasPrefix(step, "prefill") || strings.HasPrefix(step, "generate")
 }
 
-func OutputMetrics(w io.Writer, format string, metrics []Metrics, verbose bool) {
+func OutputMetrics(w io.Writer, format string, metrics []Metrics, verbose bool, perplexity float64, includePpl bool, kld float64, includeKld bool) {
 	switch format {
 	case "benchstat":
 		for _, m := range metrics {
@@ -544,12 +581,19 @@ func OutputMetrics(w io.Writer, format string, metrics []Metrics, verbose bool) 
 				if m.Count > 0 {
 					nsPerToken := float64(m.Duration.Nanoseconds()) / float64(m.Count)
 					tokensPerSec := float64(m.Count) / (float64(m.Duration.Nanoseconds()) + 1e-12) * 1e9
-					fmt.Fprintf(w, "BenchmarkModel/name=%s/step=%s 1 %.2f ns/token %.2f token/sec%s\n",
+					fmt.Fprintf(w, "BenchmarkModel/name=%s/step=%s 1 %.2f ns/token %.2f token/sec%s",
 						m.Model, m.Step, nsPerToken, tokensPerSec, promptCounts)
 				} else {
-					fmt.Fprintf(w, "BenchmarkModel/name=%s/step=%s 1 0 ns/token 0 token/sec%s\n",
+					fmt.Fprintf(w, "BenchmarkModel/name=%s/step=%s 1 0 ns/token 0 token/sec%s",
 						m.Model, m.Step, promptCounts)
 				}
+				if includePpl && m.Step == "generate" {
+					fmt.Fprintf(w, " %.4f ppl", perplexity)
+				}
+				if includeKld && m.Step == "generate" {
+					fmt.Fprintf(w, " %.6f kld", kld)
+				}
+				fmt.Fprintf(w, "\n")
 			} else if m.Step == "ttft" {
 				fmt.Fprintf(w, "BenchmarkModel/name=%s/step=ttft 1 %d ns/op\n",
 					m.Model, m.Duration.Nanoseconds())
@@ -571,14 +615,76 @@ func OutputMetrics(w io.Writer, format string, metrics []Metrics, verbose bool) 
 					nsPerToken = float64(m.Duration.Nanoseconds()) / float64(m.Count)
 					tokensPerSec = float64(m.Count) / (float64(m.Duration.Nanoseconds()) + 1e-12) * 1e9
 				}
-				fmt.Fprintf(w, "%s,%s,%d,%.2f,%.2f,%s\n", m.Model, m.Step, m.Count, nsPerToken, tokensPerSec, cachedPromptCount)
+				if includePpl && includeKld && m.Step == "generate" {
+					fmt.Fprintf(w, "%s,%s,%d,%.2f,%.2f,%s,%.4f,%.6f\n", m.Model, m.Step, m.Count, nsPerToken, tokensPerSec, cachedPromptCount, perplexity, kld)
+				} else if includePpl && m.Step == "generate" {
+					fmt.Fprintf(w, "%s,%s,%d,%.2f,%.2f,%s,%.4f,\n", m.Model, m.Step, m.Count, nsPerToken, tokensPerSec, cachedPromptCount, perplexity)
+				} else if includeKld && m.Step == "generate" {
+					fmt.Fprintf(w, "%s,%s,%d,%.2f,%.2f,%s,,%.6f\n", m.Model, m.Step, m.Count, nsPerToken, tokensPerSec, cachedPromptCount, kld)
+				} else {
+					fmt.Fprintf(w, "%s,%s,%d,%.2f,%.2f,%s,\n", m.Model, m.Step, m.Count, nsPerToken, tokensPerSec, cachedPromptCount)
+				}
 			} else {
-				fmt.Fprintf(w, "%s,%s,1,%d,0,%s\n", m.Model, m.Step, m.Duration.Nanoseconds(), cachedPromptCount)
+				fmt.Fprintf(w, "%s,%s,1,%d,0,%s,\n", m.Model, m.Step, m.Duration.Nanoseconds(), cachedPromptCount)
 			}
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown output format '%s'\n", format)
 	}
+}
+
+// saveKLDReference writes the reference logprobs to a JSON file.
+func saveKLDReference(path, model, prompt string, positions []KLDPosition) error {
+	ref := KLDReference{
+		Model:     model,
+		Prompt:    prompt,
+		Positions: positions,
+	}
+	data, err := json.Marshal(ref)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// loadKLDReference reads a reference logprobs file.
+func loadKLDReference(path string) (*KLDReference, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var ref KLDReference
+	if err := json.Unmarshal(data, &ref); err != nil {
+		return nil, err
+	}
+	return &ref, nil
+}
+
+// computeKLD computes approximate KL divergence P||Q at a single position,
+// where P is the reference distribution and Q is the test distribution.
+// Both are represented as sparse top-K logprob vectors. The missing mass
+// is assumed to be zero (i.e., only the union of observed tokens contributes).
+func computeKLD(refPos, testPos KLDPosition) float64 {
+	probs := make(map[string]float64)
+	for _, tp := range refPos.TopLogprobs {
+		probs[tp.Token] = math.Exp(tp.Logprob)
+	}
+	qrobs := make(map[string]float64)
+	for _, tp := range testPos.TopLogprobs {
+		qrobs[tp.Token] = math.Exp(tp.Logprob)
+	}
+
+	var kld float64
+	for token, p := range probs {
+		q, ok := qrobs[token]
+		if !ok || q == 0 {
+			continue
+		}
+		if p > 0 {
+			kld += p * math.Log(p/q)
+		}
+	}
+	return kld
 }
 
 func BenchmarkModel(fOpt flagOptions) error {
@@ -599,7 +705,11 @@ func BenchmarkModel(fOpt flagOptions) error {
 		out = f
 	}
 
-	outputFormatHeader(out, *fOpt.format, *fOpt.verbose)
+	kldRef := ""
+	if fOpt.kldReference != nil {
+		kldRef = *fOpt.kldReference
+	}
+	outputFormatHeader(out, *fOpt.format, *fOpt.verbose, *fOpt.perplexity, kldRef != "")
 
 	// Log prompt-tokens info in debug mode
 	if *fOpt.debug && *fOpt.promptTokens > 0 {
@@ -684,18 +794,40 @@ func BenchmarkModel(fOpt flagOptions) error {
 
 		outputModelInfo(out, *fOpt.format, info)
 
+		// Load reference if it exists (pass 2). If the file doesn't exist,
+		// this is pass 1 and we'll save the reference after the first epoch.
+		var kldRef *KLDReference
+		if fOpt.kldReference != nil && *fOpt.kldReference != "" {
+			kldRef, err = loadKLDReference(*fOpt.kldReference)
+			if err != nil {
+				if *fOpt.debug {
+					fmt.Fprintf(os.Stderr, "KLD reference %s not found, will save after first epoch (pass 1)\n", *fOpt.kldReference)
+				}
+				kldRef = nil
+			} else {
+				if *fOpt.debug {
+					fmt.Fprintf(os.Stderr, "Loaded KLD reference: model=%s, %d positions\n", kldRef.Model, len(kldRef.Positions))
+				}
+			}
+		}
+
 		// Timed epoch loop
 		shortCount := 0
 		offTargetCount, offTargetExample := 0, 0
 		for epoch := range *fOpt.epochs {
 			var responseMetrics *api.Metrics
 			var ttft time.Duration
+			var logprobs []float64
+			var epochLogprobs []api.Logprob
+			var evalCount int
 			short := false
 
 			// Retry loop: if the model hits a stop token before max-tokens,
 			// retry with a different HumanEval window.
 			for attempt := range maxShortResponseRetries + 1 {
 				responseMetrics = nil
+				logprobs = nil
+				epochLogprobs = nil
 				ttft = 0
 				var ttftOnce sync.Once
 
@@ -716,6 +848,14 @@ func BenchmarkModel(fOpt flagOptions) error {
 							ttft = time.Since(requestStart)
 						}
 					})
+
+					// Accumulate logprobs for perplexity
+					if resp.Logprobs != nil {
+						for _, logprob := range resp.Logprobs {
+							logprobs = append(logprobs, logprob.Logprob)
+						}
+						epochLogprobs = append(epochLogprobs, resp.Logprobs...)
+					}
 
 					if resp.Done {
 						responseMetrics = &resp.Metrics
@@ -738,23 +878,27 @@ func BenchmarkModel(fOpt flagOptions) error {
 				}
 
 				if responseMetrics == nil {
-					fmt.Fprintf(os.Stderr, "ERROR: No metrics received for model '%s'\n", model)
-					break
+					fmt.Fprintf(os.Stderr, "WARNING: No metrics received for model '%s' (stream ended without done)\n", model)
+					responseMetrics = &api.Metrics{}
 				}
 
 				// Check if the response was shorter than requested
-				short = *fOpt.maxTokens > 0 && responseMetrics.EvalCount < *fOpt.maxTokens
+				evalCount = responseMetrics.EvalCount
+				if evalCount == 0 && len(epochLogprobs) > 0 {
+					evalCount = len(epochLogprobs)
+				}
+				short = *fOpt.maxTokens > 0 && evalCount < *fOpt.maxTokens
 				if !short || attempt == maxShortResponseRetries {
 					break
 				}
 
 				if *fOpt.debug {
 					fmt.Fprintf(os.Stderr, "Short response (%d/%d tokens), retrying with different prompt (attempt %d/%d)\n",
-						responseMetrics.EvalCount, *fOpt.maxTokens, attempt+1, maxShortResponseRetries)
+						evalCount, *fOpt.maxTokens, attempt+1, maxShortResponseRetries)
 				}
 			}
 
-			if err != nil || responseMetrics == nil {
+			if err != nil || (responseMetrics.EvalCount == 0 && len(epochLogprobs) == 0) {
 				continue
 			}
 
@@ -770,6 +914,73 @@ func BenchmarkModel(fOpt flagOptions) error {
 			if responseMetrics.PromptEvalCachedCount != nil {
 				cachedPromptCount = *responseMetrics.PromptEvalCachedCount
 			}
+
+			// Compute perplexity from accumulated logprobs
+			perplexity := 0.0
+			if len(logprobs) > 0 {
+				var sumLogprob float64
+				for _, logprob := range logprobs {
+					sumLogprob += logprob
+				}
+				avgLogprob := sumLogprob / float64(len(logprobs))
+				perplexity = math.Exp(-avgLogprob)
+			}
+
+			// Compute KLD or save reference
+			var kld float64
+			includeKld := false
+			if fOpt.kldReference != nil && *fOpt.kldReference != "" && epochLogprobs != nil {
+				if kldRef != nil && len(kldRef.Positions) > 0 {
+					// Pass 2: compute KLD against reference
+					includeKld = true
+					var totalKld float64
+					var count int
+					for i, lp := range epochLogprobs {
+						if i >= len(kldRef.Positions) {
+							break
+						}
+						refPos := kldRef.Positions[i]
+						testPos := KLDPosition{
+							Token:       lp.Token,
+							Logprob:     lp.Logprob,
+							TopLogprobs: make([]KLDTokenProb, len(lp.TopLogprobs)),
+						}
+						for j, tp := range lp.TopLogprobs {
+							testPos.TopLogprobs[j] = KLDTokenProb{Token: tp.Token, Logprob: tp.Logprob}
+						}
+						totalKld += computeKLD(refPos, testPos)
+						count++
+					}
+					if count > 0 {
+						kld = totalKld / float64(count)
+					}
+				} else if kldRef == nil {
+					// Pass 1: save reference for this model
+					positions := make([]KLDPosition, len(epochLogprobs))
+					for i, lp := range epochLogprobs {
+						positions[i] = KLDPosition{
+							Token:       lp.Token,
+							Logprob:     lp.Logprob,
+							TopLogprobs: make([]KLDTokenProb, len(lp.TopLogprobs)),
+						}
+						for j, tp := range lp.TopLogprobs {
+							positions[i].TopLogprobs[j] = KLDTokenProb{Token: tp.Token, Logprob: tp.Logprob}
+						}
+					}
+					prompt := *fOpt.prompt
+					if *fOpt.promptTokens > 0 {
+						prompt = benchPromptContent(fOpt, 0, plan)
+					} else {
+						prompt = fmt.Sprintf("[%d] %s", epoch, prompt)
+					}
+					if err := saveKLDReference(*fOpt.kldReference, model, prompt, positions); err != nil {
+						fmt.Fprintf(os.Stderr, "WARNING: could not save KLD reference: %v\n", err)
+					} else if *fOpt.debug {
+						fmt.Fprintf(os.Stderr, "Saved KLD reference: %s (%d positions)\n", *fOpt.kldReference, len(positions))
+					}
+				}
+			}
+
 			metrics := []Metrics{
 				{
 					Model:             model,
@@ -781,7 +992,7 @@ func BenchmarkModel(fOpt flagOptions) error {
 				{
 					Model:    model,
 					Step:     "generate",
-					Count:    responseMetrics.EvalCount,
+					Count:    evalCount,
 					Duration: responseMetrics.EvalDuration,
 				},
 				{
@@ -804,7 +1015,7 @@ func BenchmarkModel(fOpt flagOptions) error {
 				},
 			}
 
-			OutputMetrics(out, *fOpt.format, metrics, *fOpt.verbose)
+			OutputMetrics(out, *fOpt.format, metrics, *fOpt.verbose, perplexity, *fOpt.perplexity, kld, includeKld)
 
 			if *fOpt.debug && *fOpt.promptTokens > 0 {
 				if responseMetrics.PromptEvalCachedCount == nil {
@@ -1206,7 +1417,7 @@ func benchmarkOpenAI(fOpt flagOptions, models []string, out io.Writer) error {
 				},
 			)
 
-			OutputMetrics(out, *fOpt.format, metrics, *fOpt.verbose)
+			OutputMetrics(out, *fOpt.format, metrics, *fOpt.verbose, 0, false, 0, false)
 
 			if *fOpt.debug && *fOpt.promptTokens > 0 {
 				fmt.Fprintf(os.Stderr, "Generated prompt targeting ~%d tokens (actual prompt_tokens: %d)\n",
@@ -1266,6 +1477,9 @@ func main() {
 		decisionFile: flag.String("decision", "", "Decision JSONL corpus for /v1/systemone (instead of chat)"),
 		decisionMode: flag.String("decision-mode", "score", "Decision label policy: score reports accuracy; regression requires 100%"),
 		concurrency:  flag.Int("concurrency", 1, "Maximum in-flight requests (currently requires -decision; 1 = serial)"),
+		perplexity:   flag.Bool("perplexity", false, "Compute perplexity from generated token logprobs"),
+		kldReference: flag.String("kld-reference", "", "Path for KLD reference file. Pass 1: save reference; Pass 2: load and compute KLD"),
+		kldTopK:      flag.Int("kld-top-k", 20, "Number of top logprobs to capture for KLD computation"),
 	}
 
 	flag.Usage = func() {
@@ -1278,6 +1492,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  bench -model gemma3,llama3 -epochs 6\n")
 		fmt.Fprintf(os.Stderr, "  bench -model gemma3 -epochs 6 -prompt-tokens 512 -format csv\n")
 		fmt.Fprintf(os.Stderr, "  bench -model gemma3 -openai http://localhost:11434/v1\n")
+		fmt.Fprintf(os.Stderr, "  bench -model ref-model -kld-reference ref.json -epochs 1 -kld-top-k 20\n")
+		fmt.Fprintf(os.Stderr, "  bench -model test-model -kld-reference ref.json -epochs 6\n")
 	}
 	flag.Parse()
 	if *fOpt.decisionFile != "" {

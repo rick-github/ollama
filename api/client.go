@@ -140,6 +140,8 @@ func (c *Client) do(ctx context.Context, method, path string, reqData, respData 
 
 	if token != "" {
 		request.Header.Set("Authorization", token)
+	} else if apiKey := envconfig.ApiKey(); apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	respObj, err := c.http.Do(request)
@@ -206,6 +208,8 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 
 	if token != "" {
 		request.Header.Set("Authorization", token)
+	} else if apiKey := envconfig.ApiKey(); apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	response, err := c.http.Do(request)
@@ -389,6 +393,32 @@ func (c *Client) ListRunning(ctx context.Context) (*ProcessResponse, error) {
 		return nil, err
 	}
 	return &lr, nil
+}
+
+// Drain controls the server's drain mode and model unloading. When req.Drain
+// is true, new inference requests that cannot be served by an already-loaded
+// runner are rejected with a 503 error while in-flight and queued work
+// continues to be processed. When req.Drain is false, the server resumes
+// accepting new requests. When req.Unload is true, all loaded model runners
+// are unloaded. When req.Graceful is true with req.Unload, the server waits
+// for in-flight requests to complete before unloading each runner; otherwise
+// unloading is immediate. The fields are independent: any combination may be
+// set in a single request.
+func (c *Client) Drain(ctx context.Context, req *DrainRequest) (*DrainResponse, error) {
+	var resp DrainResponse
+	if err := c.do(ctx, http.MethodPost, "/api/drain", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DrainStatus returns the current drain mode status.
+func (c *Client) DrainStatus(ctx context.Context) (*DrainResponse, error) {
+	var resp DrainResponse
+	if err := c.do(ctx, http.MethodGet, "/api/drain", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // Copy copies a model - creating a model with another name from an existing

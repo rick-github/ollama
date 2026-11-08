@@ -2692,6 +2692,36 @@ func TestFromResponsesRequest_Truncation(t *testing.T) {
 	}
 }
 
+func TestFromResponsesRequest_Args(t *testing.T) {
+	reqJSON := `{
+		"model": "gemma4:31b",
+		"input": "Read this image",
+		"args": ["--image-max-tokens", "4096"]
+	}`
+
+	var req ResponsesRequest
+	if err := json.Unmarshal([]byte(reqJSON), &req); err != nil {
+		t.Fatalf("failed to unmarshal request: %v", err)
+	}
+
+	chatReq, err := FromResponsesRequest(req)
+	if err != nil {
+		t.Fatalf("failed to convert request: %v", err)
+	}
+
+	got, ok := chatReq.Options["args"]
+	if !ok {
+		t.Fatalf("expected args in options, got: %#v", chatReq.Options)
+	}
+	args, ok := got.([]string)
+	if !ok {
+		t.Fatalf("expected []string, got %T: %v", got, got)
+	}
+	if len(args) != 2 || args[0] != "--image-max-tokens" || args[1] != "4096" {
+		t.Fatalf("unexpected args: %#v", args)
+	}
+}
+
 func TestFromResponsesRequest_TextFormatJsonSchema(t *testing.T) {
 	reqJSON := `{
 		"model": "gpt-oss:20b",

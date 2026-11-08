@@ -588,17 +588,24 @@ type Options struct {
 	PresencePenalty  float32  `json:"presence_penalty,omitempty"`
 	FrequencyPenalty float32  `json:"frequency_penalty,omitempty"`
 	Stop             []string `json:"stop,omitempty"`
+	ThinkLevels      []string `json:"think_level,omitempty"`
 }
 
 // Runner options which must be set when the model is loaded into memory
 type Runner struct {
-	NumCtx          int   `json:"num_ctx,omitempty"`
-	NumBatch        int   `json:"num_batch,omitempty"`
-	NumGPU          int   `json:"num_gpu,omitempty"`
-	MainGPU         *int  `json:"main_gpu,omitempty"`
-	UseMMap         *bool `json:"use_mmap,omitempty"`
-	NumThread       int   `json:"num_thread,omitempty"`
-	DraftNumPredict int   `json:"draft_num_predict,omitempty"`
+	NumCtx          int         `json:"num_ctx,omitempty"`
+	NumBatch        int         `json:"num_batch,omitempty"`
+	NumGPU          int         `json:"num_gpu,omitempty"`
+	MainGPU         *int        `json:"main_gpu,omitempty"`
+	UseMMap         *bool       `json:"use_mmap,omitempty"`
+	NumThread       int         `json:"num_thread,omitempty"`
+	NumParallel     int         `json:"num_parallel,omitempty"`
+	DraftNumPredict int         `json:"draft_num_predict,omitempty"`
+	Think           *ThinkValue `json:"think,omitempty"`
+	Env             []string    `json:"env,omitempty"`
+	FlashAttention  *bool       `json:"flash_attention,omitempty"`
+	KvCacheType     string      `json:"kv_cache_type,omitempty"`
+	Args            []string    `json:"args,omitempty"`
 }
 
 // SystemOneRequest is the request passed to [Client.SystemOne]. It asks a
@@ -762,6 +769,9 @@ type CreateRequest struct {
 	// Parser is the name of the parser used to parse the output of the request.
 	Parser string `json:"parser,omitempty"`
 
+	// Jinja is a custom Jinja2 chat template that takes precedence over TEMPLATE, RENDERER, and PARSER.
+	Jinja string `json:"jinja,omitempty"`
+
 	// Requires is the minimum version of Ollama required by the model.
 	Requires string `json:"requires,omitempty"`
 
@@ -812,6 +822,7 @@ type ShowResponse struct {
 	System         string             `json:"system,omitempty"`
 	Renderer       string             `json:"renderer,omitempty"`
 	Parser         string             `json:"parser,omitempty"`
+	Jinja          string             `json:"jinja,omitempty"`
 	TemplateSource string             `json:"template_source,omitempty"`
 	Details        ModelDetails       `json:"details,omitempty"`
 	Messages       []Message          `json:"messages,omitempty"`
@@ -958,6 +969,34 @@ type TokenResponse struct {
 	Token string `json:"token"`
 }
 
+// DrainRequest is the request for [Client.Drain].
+type DrainRequest struct {
+	// Drain controls drain mode. When nil, drain state is left unchanged.
+	// When true, new inference requests that cannot be served by an
+	// already-loaded runner are rejected with a 503 error. When false,
+	// the server resumes accepting new requests.
+	Drain *bool `json:"drain,omitempty"`
+
+	// Unload, when true, unloads all currently loaded model runners.
+	// This is independent of drain: you can unload without entering drain
+	// mode, or combine both for a full graceful shutdown sequence.
+	Unload bool `json:"unload,omitempty"`
+
+	// Graceful, when true with Unload, waits for in-flight requests to
+	// complete before unloading each runner. Without Graceful, Unload
+	// terminates active generations immediately. Graceful without Unload
+	// has no effect.
+	Graceful bool `json:"graceful,omitempty"`
+}
+
+// DrainResponse is the response from [Client.Drain].
+type DrainResponse struct {
+	Draining            bool           `json:"draining"`
+	PendingQueue        int            `json:"pending_queue"`
+	PendingQueueByModel map[string]int `json:"pending_queue_by_model,omitempty"`
+	LoadedModels        int            `json:"loaded_models"`
+}
+
 type CloudStatus struct {
 	Disabled bool   `json:"disabled"`
 	Source   string `json:"source"`
@@ -966,6 +1005,23 @@ type CloudStatus struct {
 // StatusResponse is the response from [Client.CloudStatusExperimental].
 type StatusResponse struct {
 	Cloud CloudStatus `json:"cloud"`
+}
+
+// HealthResponse is the response from the /health endpoint.
+type HealthResponse struct {
+	Status string        `json:"status"` // "ok" or "unhealthy"
+	Model  *HealthModel  `json:"model,omitempty"`
+	Models []HealthModel `json:"models,omitempty"`
+}
+
+// HealthModel is the health status of a single loaded model runner.
+type HealthModel struct {
+	Name    string `json:"name"`
+	Digest  string `json:"digest"`
+	Status  string `json:"status"` // "ok", "loading", "unhealthy"
+	Pid     int    `json:"pid,omitempty"`
+	Port    int    `json:"port,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // WebSearchRequest is the request for [Client.WebSearchExperimental].
@@ -1203,6 +1259,21 @@ func (opts *Options) FromMap(m map[string]any) error {
 						return fmt.Errorf("option %q must be of type integer", key)
 					}
 					field.Set(reflect.ValueOf(&i))
+				case reflect.Struct:
+					if field.Type() == reflect.TypeOf((*ThinkValue)(nil)) {
+						tv := &ThinkValue{}
+						switch v := val.(type) {
+						case bool:
+							tv.Value = v
+						case string:
+							tv.Value = v
+						default:
+							return fmt.Errorf("option %q must be a boolean or string", key)
+						}
+						field.Set(reflect.ValueOf(tv))
+					} else {
+						return fmt.Errorf("unknown type loading config params: %v %v", field.Kind(), field.Type())
+					}
 				default:
 					return fmt.Errorf("unknown type loading config params: %v %v", field.Kind(), field.Type())
 				}
@@ -1218,9 +1289,16 @@ func (opts *Options) FromMap(m map[string]any) error {
 // DefaultOptions is the default set of options for [GenerateRequest]; these
 // values are used unless the user specifies other values explicitly.
 func DefaultOptions() Options {
+	var flashAttention *bool
+	if s := envconfig.Var("OLLAMA_FLASH_ATTENTION"); s != "" {
+		if b, err := strconv.ParseBool(s); err == nil {
+			flashAttention = &b
+		}
+	}
+
 	return Options{
 		// options set on request to runner
-		NumPredict: -1,
+		NumPredict: envconfig.NumPredict(),
 
 		// set a minimal num_keep to avoid issues on context shifts
 		NumKeep:          4,
@@ -1236,12 +1314,16 @@ func DefaultOptions() Options {
 
 		Runner: Runner{
 			// options set when the model is loaded
-			NumCtx:          int(envconfig.ContextLength()),
-			NumBatch:        512,
-			NumGPU:          -1, // -1 here indicates that NumGPU should be set dynamically
-			NumThread:       0,  // let the runtime decide
-			DraftNumPredict: 4,
-			UseMMap:         nil,
+			NumCtx:          envconfig.ContextLength(),
+			NumBatch:        envconfig.NumBatch(),
+			NumGPU:          envconfig.NumGPU(),    // -1 here indicates that NumGPU should be set dynamically
+			NumThread:       envconfig.NumThread(), // 0 here indicates let the runtime decide
+			NumParallel:     envconfig.NumParallel(),
+			DraftNumPredict: envconfig.DraftNumPredict(),
+			UseMMap:         envconfig.UseMMap(),
+			Think:           &ThinkValue{Value: envconfig.Think(true)},
+			FlashAttention:  flashAttention,
+			KvCacheType:     strings.ToLower(strings.TrimSpace(envconfig.KvCacheType())),
 		},
 	}
 }
@@ -1249,18 +1331,56 @@ func DefaultOptions() Options {
 // ThinkValue represents a boolean or model-defined thinking level.
 type ThinkValue = model.ThinkValue
 
-// ValidateLegacyThinking checks named levels for models without thinking metadata.
-// Transport types are checked by ThinkValue.UnmarshalJSON or IsValid.
-func ValidateLegacyThinking(think *ThinkValue) error {
-	if !think.IsString() {
-		return nil
-	}
-	switch think.String() {
-	case "low", "medium", "high", "max":
-		return nil
+// parseThinkValueFromString parses a Modelfile PARAMETER value into a
+// *ThinkValue. Accepts "true"/"false" or any named thinking level string.
+func parseThinkValueFromString(s string) (*ThinkValue, error) {
+	switch s {
+	case "true":
+		return &ThinkValue{Value: true}, nil
+	case "false":
+		return &ThinkValue{Value: false}, nil
 	default:
-		return fmt.Errorf("invalid think value: %q (must be \"high\", \"medium\", \"low\", \"max\", true, or false)", think.String())
+		return &ThinkValue{Value: s}, nil
 	}
+}
+
+// ValidateLegacyThinking checks named levels for models without thinking
+// metadata. Transport types are checked by ThinkValue.UnmarshalJSON or
+// IsValid. When validLevels is provided, only those values (plus booleans
+// under the default set) are accepted; otherwise the hardcoded defaults
+// are used. Boolean think values are validated against the levels list
+// (as "true"/"false") when custom levels are set, so a model declaring only
+// "true" rejects think:false.
+func ValidateLegacyThinking(think *ThinkValue, validLevels ...string) error {
+	if think == nil || think.Value == nil {
+		return nil
+	}
+	levels := validLevels
+	defaultLevels := levels == nil
+	if defaultLevels {
+		levels = []string{"low", "medium", "high", "max"}
+	}
+	// Booleans are always valid under the default level set.
+	if think.IsBool() && defaultLevels {
+		return nil
+	}
+	var s string
+	switch {
+	case think.IsBool():
+		s = strconv.FormatBool(think.Bool())
+	case think.IsString():
+		s = think.String()
+	}
+	for _, l := range levels {
+		if s == l {
+			return nil
+		}
+	}
+	suffix := ""
+	if defaultLevels {
+		suffix = ", true, or false"
+	}
+	return fmt.Errorf("invalid think value: %q (must be %s%s)", s, strings.Join(levels, ", "), suffix)
 }
 
 type Duration struct {
@@ -1368,6 +1488,16 @@ func FormatParams(params map[string][]string) (map[string]any, error) {
 							return nil, fmt.Errorf("invalid int value %s", vals)
 						}
 						out[key] = intVal
+					case reflect.Struct:
+						if field.Type() == reflect.TypeOf((*ThinkValue)(nil)) {
+							tv, err := parseThinkValueFromString(vals[0])
+							if err != nil {
+								return nil, fmt.Errorf("invalid value %s for %s: %w", vals, key, err)
+							}
+							out[key] = tv
+						} else {
+							return nil, fmt.Errorf("unknown type %s for %s", field.Kind(), key)
+						}
 					default:
 						return nil, fmt.Errorf("unknown type %s for %s", field.Kind(), key)
 					}

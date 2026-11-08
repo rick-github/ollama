@@ -925,11 +925,12 @@ func TestCloudResponsesUnsupportedWebSearchPassthrough(t *testing.T) {
 		cloudProxyBaseURL = originalBaseURL
 		cloudProxySignRequest = originalSignRequest
 	})
+	s := &Server{}
 
 	router := gin.New()
 	router.POST(
 		"/v1/responses",
-		cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
+		s.cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
 		middleware.ResponsesMiddleware(),
 		func(c *gin.Context) { c.Status(http.StatusTeapot) },
 	)
@@ -1104,11 +1105,12 @@ func TestCloudPassthroughSkipsAnthropicWebSearch(t *testing.T) {
 	original := cloudProxyBaseURL
 	cloudProxyBaseURL = upstream.URL
 	t.Cleanup(func() { cloudProxyBaseURL = original })
+	s := &Server{}
 
 	router := gin.New()
 	router.POST(
 		"/v1/messages",
-		cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
+		s.cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
 		middleware.AnthropicMessagesMiddleware(),
 		func(c *gin.Context) { c.Status(http.StatusTeapot) },
 	)
@@ -1162,12 +1164,13 @@ func TestCloudPassthroughSkipsAnthropicWebSearchLegacySuffix(t *testing.T) {
 
 	original := cloudProxyBaseURL
 	cloudProxyBaseURL = upstream.URL
+	s := &Server{}
 	t.Cleanup(func() { cloudProxyBaseURL = original })
 
 	router := gin.New()
 	router.POST(
 		"/v1/messages",
-		cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
+		s.cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
 		middleware.AnthropicMessagesMiddleware(),
 		func(c *gin.Context) { c.Status(http.StatusTeapot) },
 	)

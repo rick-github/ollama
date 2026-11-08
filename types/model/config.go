@@ -14,6 +14,7 @@ type ConfigV2 struct {
 	GenerationDefaults GenerationDefaults `json:"generation_defaults,omitempty"`
 	Renderer           string             `json:"renderer,omitempty"`
 	Parser             string             `json:"parser,omitempty"`
+	Jinja              string             `json:"jinja,omitempty"`
 	Requires           string             `json:"requires,omitempty"`
 
 	RemoteHost  string `json:"remote_host,omitempty"`

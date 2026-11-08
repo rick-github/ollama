@@ -2619,6 +2619,66 @@ func TestNewCreateRequest(t *testing.T) {
 				},
 			},
 		},
+		{
+			"think true is saved in parameters",
+			"newmodel",
+			runOptions{
+				Model:       "mymodel",
+				ParentModel: "parentmodel",
+				Think:       &api.ThinkValue{Value: true},
+			},
+			&api.CreateRequest{
+				From:       "parentmodel",
+				Model:      "newmodel",
+				Parameters: map[string]any{"think": true},
+			},
+		},
+		{
+			"think level string is saved in parameters",
+			"newmodel",
+			runOptions{
+				Model:       "mymodel",
+				ParentModel: "parentmodel",
+				Think:       &api.ThinkValue{Value: "high"},
+			},
+			&api.CreateRequest{
+				From:       "parentmodel",
+				Model:      "newmodel",
+				Parameters: map[string]any{"think": "high"},
+			},
+		},
+		{
+			"think is merged with existing options",
+			"newmodel",
+			runOptions{
+				Model:       "mymodel",
+				ParentModel: "parentmodel",
+				Options:     map[string]any{"temperature": 0.5},
+				Think:       &api.ThinkValue{Value: "high"},
+			},
+			&api.CreateRequest{
+				From:  "parentmodel",
+				Model: "newmodel",
+				Parameters: map[string]any{
+					"temperature": 0.5,
+					"think":       "high",
+				},
+			},
+		},
+		{
+			"think false is saved in parameters",
+			"newmodel",
+			runOptions{
+				Model:       "mymodel",
+				ParentModel: "parentmodel",
+				Think:       &api.ThinkValue{Value: false},
+			},
+			&api.CreateRequest{
+				From:       "parentmodel",
+				Model:      "newmodel",
+				Parameters: map[string]any{"think": false},
+			},
+		},
 	}
 
 	for _, tt := range tests {

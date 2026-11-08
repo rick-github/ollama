@@ -138,6 +138,8 @@ func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error)
 				return nil, fmt.Errorf("unknown capability: %q", c.Args)
 			}
 			req.Capabilities = append(req.Capabilities, c.Args)
+		case "jinja":
+			req.Jinja = c.Args
 		case "requires":
 			// golang.org/x/mod/semver requires "v" prefix
 			requires := c.Args
@@ -443,7 +445,7 @@ func (c Command) String() string {
 	switch c.Name {
 	case "model":
 		fmt.Fprintf(&sb, "FROM %s", c.Args)
-	case "license", "template", "system", "adapter", "renderer", "parser", "requires", "draft", "capability":
+	case "license", "template", "system", "adapter", "renderer", "parser", "jinja", "requires", "draft", "capability":
 		fmt.Fprintf(&sb, "%s %s", strings.ToUpper(c.Name), quote(c.Args))
 	case "message":
 		role, message, _ := strings.Cut(c.Args, ": ")
@@ -675,36 +677,103 @@ func parseRuneForState(r rune, cs state) (state, rune, error) {
 }
 
 func quote(s string) string {
-	if strings.Contains(s, "\n") || strings.HasPrefix(s, " ") || strings.HasSuffix(s, " ") {
-		if strings.Contains(s, "\"") {
-			return `"""` + s + `"""`
-		}
-
-		return `"` + s + `"`
+	if !strings.Contains(s, "\n") && !strings.HasPrefix(s, " ") && !strings.HasSuffix(s, " ") &&
+		!strings.HasPrefix(s, `"`) && !strings.HasPrefix(s, `'`) &&
+		!strings.HasSuffix(s, `"`) && !strings.HasSuffix(s, `'`) {
+		return s
 	}
 
-	return s
+	multiline := strings.Contains(s, "\n")
+	maxD := maxRun(s, '"')
+	maxS := maxRun(s, '\'')
+
+	countD := countFor(maxD, multiline)
+	countS := countFor(maxS, multiline)
+
+	if countD <= countS {
+		return strings.Repeat(`"`, countD) + s + strings.Repeat(`"`, countD)
+	}
+	return strings.Repeat("'", countS) + s + strings.Repeat("'", countS)
 }
 
 func unquote(s string) (string, bool) {
-	// TODO: single quotes
-	if len(s) >= 3 && s[:3] == `"""` {
-		if len(s) >= 6 && s[len(s)-3:] == `"""` {
-			return s[3 : len(s)-3], true
-		}
-
-		return "", false
+	if len(s) == 0 {
+		return s, true
 	}
 
-	if len(s) >= 1 && s[0] == '"' {
-		if len(s) >= 2 && s[len(s)-1] == '"' {
-			return s[1 : len(s)-1], true
-		}
-
-		return "", false
+	q := s[0]
+	if q != '"' && q != '\'' {
+		return s, true
 	}
 
-	return s, true
+	maxN := 0
+	for maxN < len(s) && s[maxN] == q {
+		maxN++
+	}
+
+	if maxN == 2 {
+		maxN = 1
+	}
+
+	minN := 1
+	if maxN >= 3 {
+		minN = 3
+	}
+
+	allQuotes := maxN == len(s)
+
+	tryN := func(n int) (string, bool) {
+		if n == 2 || n < minN {
+			return "", false
+		}
+		if len(s) < 2*n {
+			return "", false
+		}
+		if !strings.HasSuffix(s, strings.Repeat(string(q), n)) {
+			return "", false
+		}
+		return s[n : len(s)-n], true
+	}
+
+	if allQuotes {
+		for n := maxN; n >= minN; n-- {
+			if r, ok := tryN(n); ok {
+				return r, true
+			}
+		}
+	} else {
+		if r, ok := tryN(maxN); ok {
+			return r, true
+		}
+	}
+
+	return "", false
+}
+
+func maxRun(s string, ch byte) int {
+	max, cur := 0, 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ch {
+			cur++
+			if cur > max {
+				max = cur
+			}
+		} else {
+			cur = 0
+		}
+	}
+	return max
+}
+
+func countFor(maxRun int, multiline bool) int {
+	n := maxRun + 1
+	if n == 2 {
+		n = 3
+	}
+	if multiline && n < 3 {
+		n = 3
+	}
+	return n
 }
 
 func isAlpha(r rune) bool {
@@ -729,7 +798,7 @@ func isValidMessageRole(role string) bool {
 
 func isValidCommand(cmd string) bool {
 	switch strings.ToLower(cmd) {
-	case "from", "license", "template", "system", "adapter", "draft", "renderer", "parser", "parameter", "message", "requires", "capability":
+	case "from", "license", "template", "system", "adapter", "draft", "renderer", "parser", "jinja", "parameter", "message", "requires", "capability":
 		return true
 	default:
 		return false

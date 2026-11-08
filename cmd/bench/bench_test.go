@@ -39,6 +39,9 @@ func createTestFlagOptions() flagOptions {
 	numCtx := 0
 	openaiURL := ""
 	apiKey := ""
+	perplexity := false
+	kldReference := ""
+	kldTopK := 20
 
 	return flagOptions{
 		models:       &models,
@@ -58,6 +61,9 @@ func createTestFlagOptions() flagOptions {
 		numCtx:       &numCtx,
 		openaiURL:    &openaiURL,
 		apiKey:       &apiKey,
+		perplexity:   &perplexity,
+		kldReference: &kldReference,
+		kldTopK:      &kldTopK,
 	}
 }
 
@@ -337,7 +343,7 @@ func TestBenchmarkModel_NoMetrics(t *testing.T) {
 		}
 	})
 
-	if !strings.Contains(output, "ERROR: No metrics received") {
+	if !strings.Contains(output, "WARNING: No metrics received") {
 		t.Errorf("Expected no metrics error message, got: %s", output)
 	}
 }
@@ -1157,7 +1163,7 @@ func TestBenchmarkModel_PrefillExcludesCachedTokens(t *testing.T) {
 			break
 		}
 	}
-	if prefillRow == "" || !strings.HasSuffix(prefillRow, ",4") {
+	if prefillRow == "" || !strings.HasSuffix(prefillRow, ",4,") {
 		t.Errorf("prefill row did not exclude cached prompt tokens:\n%s", output)
 	}
 }
@@ -1550,7 +1556,7 @@ func TestOutputMetrics_Benchstat(t *testing.T) {
 		{Model: "m1", Step: "total", Count: 1, Duration: 600 * time.Millisecond},
 	}
 
-	OutputMetrics(&buf, "benchstat", metrics, false)
+	OutputMetrics(&buf, "benchstat", metrics, false, 12.5, true, 0, false)
 	output := buf.String()
 
 	if !strings.Contains(output, "step=prefill") {
@@ -1565,6 +1571,18 @@ func TestOutputMetrics_Benchstat(t *testing.T) {
 	if !strings.Contains(output, "10 processed-prompt-token 4 cached-prompt-token") {
 		t.Errorf("Expected prompt cache counts on prefill line, got: %s", output)
 	}
+
+	// Perplexity should appear on the generate line when a non-zero value is provided
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		if strings.Contains(line, "step=generate") {
+			if !strings.Contains(line, "ppl") {
+				t.Errorf("Expected ppl on generate line, got: %s", line)
+			}
+			if !strings.Contains(line, "12.5000 ppl") {
+				t.Errorf("Expected 12.5000 ppl on generate line, got: %s", line)
+			}
+		}
+	}
 }
 
 func TestOutputMetrics_BenchstatFormat(t *testing.T) {
@@ -1573,7 +1591,7 @@ func TestOutputMetrics_BenchstatFormat(t *testing.T) {
 		{Model: "m1", Step: "prefill", Count: 10, Duration: 100 * time.Millisecond},
 	}
 
-	OutputMetrics(&buf, "benchstat", metrics, false)
+	OutputMetrics(&buf, "benchstat", metrics, false, 0, false, 0, false)
 	output := buf.String()
 
 	// Verify benchstat format: BenchmarkModel/name=m1/step=prefill 1 <ns/token> ns/token <tokens/sec> token/sec
@@ -1597,9 +1615,9 @@ func TestOutputMetrics_CachedPromptAvailability(t *testing.T) {
 		count *int
 		want  string
 	}{
-		{name: "unavailable", want: "m1,prefill,10,10000000.00,100.00,"},
-		{name: "zero", count: testIntPtr(0), want: "m1,prefill,10,10000000.00,100.00,0"},
-		{name: "positive", count: testIntPtr(4), want: "m1,prefill,10,10000000.00,100.00,4"},
+		{name: "unavailable", want: "m1,prefill,10,10000000.00,100.00,,"},
+		{name: "zero", count: testIntPtr(0), want: "m1,prefill,10,10000000.00,100.00,0,"},
+		{name: "positive", count: testIntPtr(4), want: "m1,prefill,10,10000000.00,100.00,4,"},
 	}
 
 	for _, tt := range tests {
@@ -1611,7 +1629,7 @@ func TestOutputMetrics_CachedPromptAvailability(t *testing.T) {
 				Count:             10,
 				CachedPromptCount: tt.count,
 				Duration:          100 * time.Millisecond,
-			}}, false)
+			}}, false, 0, false, 0, false)
 			if got := strings.TrimSpace(buf.String()); got != tt.want {
 				t.Errorf("output = %q, want %q", got, tt.want)
 			}
@@ -1735,19 +1753,23 @@ func TestFetchMemoryUsage_CPUSpill(t *testing.T) {
 
 func TestOutputFormatHeader(t *testing.T) {
 	tests := []struct {
-		format   string
-		verbose  bool
-		contains []string
+		format     string
+		verbose    bool
+		includePpl bool
+		includeKld bool
+		contains   []string
 	}{
-		{"csv", false, []string{"NAME,STEP,COUNT,NS_PER_COUNT,TOKEN_PER_SEC,CACHED_PROMPT_COUNT"}},
-		{"benchstat", true, []string{"goos:", "goarch:"}},
-		{"benchstat", false, []string{}},
+		{"csv", false, false, false, []string{"NAME,STEP,COUNT,NS_PER_COUNT,TOKEN_PER_SEC,CACHED_PROMPT_COUNT"}},
+		{"csv", false, true, false, []string{"PERPLEXITY"}},
+		{"csv", false, false, true, []string{"KLD"}},
+		{"benchstat", true, false, false, []string{"goos:", "goarch:"}},
+		{"benchstat", false, false, false, []string{}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.format, func(t *testing.T) {
 			var buf bytes.Buffer
-			outputFormatHeader(&buf, tt.format, tt.verbose)
+			outputFormatHeader(&buf, tt.format, tt.verbose, tt.includePpl, tt.includeKld)
 			output := buf.String()
 
 			for _, expected := range tt.contains {

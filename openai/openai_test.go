@@ -62,6 +62,33 @@ func TestFromChatRequest_Basic(t *testing.T) {
 	}
 }
 
+func TestFromChatRequest_Args(t *testing.T) {
+	req := ChatCompletionRequest{
+		Model: "test-model",
+		Messages: []Message{
+			{Role: "user", Content: "Hello"},
+		},
+		Args: []string{"--image-max-tokens", "4096"},
+	}
+
+	result, err := FromChatRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, ok := result.Options["args"]
+	if !ok {
+		t.Fatalf("expected args in options, got: %#v", result.Options)
+	}
+	args, ok := got.([]string)
+	if !ok {
+		t.Fatalf("expected []string, got %T: %v", got, got)
+	}
+	if len(args) != 2 || args[0] != "--image-max-tokens" || args[1] != "4096" {
+		t.Fatalf("unexpected args: %#v", args)
+	}
+}
+
 func TestFromChatRequest_ReasoningEffort(t *testing.T) {
 	effort := func(s string) *string { return &s }
 
@@ -433,6 +460,33 @@ func TestSamplerOptionsOmittedVsExplicit(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestFromCompleteRequest_Args(t *testing.T) {
+	temp := float32(0.8)
+	req := CompletionRequest{
+		Model:       "test-model",
+		Prompt:      "Hello",
+		Temperature: &temp,
+		Args:        []string{"--image-max-tokens", "4096"},
+	}
+
+	result, err := FromCompleteRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, ok := result.Options["args"]
+	if !ok {
+		t.Fatalf("expected args in options, got: %#v", result.Options)
+	}
+	args, ok := got.([]string)
+	if !ok {
+		t.Fatalf("expected []string, got %T: %v", got, got)
+	}
+	if len(args) != 2 || args[0] != "--image-max-tokens" || args[1] != "4096" {
+		t.Fatalf("unexpected args: %#v", args)
 	}
 }
 

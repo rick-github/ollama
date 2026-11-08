@@ -99,7 +99,7 @@ func benchmarkDecision(opts flagOptions, models []string, out io.Writer) error {
 			return err
 		}
 	} else {
-		outputFormatHeader(out, *opts.format, *opts.verbose)
+		outputFormatHeader(out, *opts.format, *opts.verbose, false, false)
 	}
 	var failures []error
 	for _, name := range models {
@@ -226,7 +226,7 @@ func benchmarkDecisionModel(opts flagOptions, client *api.Client, name string, c
 			}
 		} else if s.Err == nil {
 			step := fmt.Sprintf("decision/case=%s/input=%d/questions=%d/images=%d/concurrency=%d", url.PathEscape(s.Case.ID), s.Response.Usage.InputTokens, s.Case.Request.Questions.Len(), len(s.Case.Request.Images), *opts.concurrency)
-			OutputMetrics(out, *opts.format, []Metrics{{Model: name, Step: step + "/metric=http", Count: 1, Duration: s.Duration}}, *opts.verbose)
+			OutputMetrics(out, *opts.format, []Metrics{{Model: name, Step: step + "/metric=http", Count: 1, Duration: s.Duration}}, *opts.verbose, 0, false, 0, false)
 		}
 	}
 	if measureMemory && *opts.warmup == 0 {

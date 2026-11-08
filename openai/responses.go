@@ -644,6 +644,9 @@ type ResponsesRequest struct {
 
 	// optional, default is false
 	Stream *bool `json:"stream,omitempty"`
+
+	// optional, forwarded to the model runner as extra command-line arguments
+	Args []string `json:"args,omitempty"`
 }
 
 // FromResponsesRequest converts a ResponsesRequest to api.ChatRequest.
@@ -859,6 +862,10 @@ func FromResponsesRequest(r ResponsesRequest, thinking ...*model.Thinking) (*api
 
 	if r.MaxOutputTokens != nil {
 		options["num_predict"] = *r.MaxOutputTokens
+	}
+
+	if len(r.Args) > 0 {
+		options["args"] = r.Args
 	}
 
 	think := r.Think

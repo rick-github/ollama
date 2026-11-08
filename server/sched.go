@@ -38,6 +38,10 @@ type LlmRequest struct {
 	errCh           chan error
 	schedAttempts   uint
 
+	// authTag is the auth token extracted from the request, used for
+	// per-user metric labelling. "anon" when no Authorization header.
+	authTag string
+
 	// oomRetryAttempted is set after a llama-server load crash triggers an
 	// evict-all-and-retry. Prevents infinite retry on persistent load failures.
 	oomRetryAttempted bool
@@ -66,6 +70,17 @@ type Scheduler struct {
 	expiredCh     chan *runnerRef
 	unloadedCh    chan any
 
+	// draining is set when the server is in drain mode: new requests are
+	// rejected with ErrDraining while in-flight and queued work continues
+	// to be processed.
+	draining atomic.Bool
+
+	// pendingMu protects pendingModels, a count of queued requests keyed
+	// by model display name. Incremented when a request enters pendingReqCh
+	// in getRunner, decremented when it is dequeued in processPending.
+	pendingMu     sync.Mutex
+	pendingModels map[string]int
+
 	// loadedMu protects loaded and activeLoading
 	loadedMu sync.Mutex
 
@@ -81,6 +96,8 @@ type Scheduler struct {
 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
 	getSystemInfoFn func() ml.SystemInfo
 	waitForRecovery time.Duration
+
+	schedulerMetricsState
 }
 
 // loadedModelsForName returns models still owned by loaded runners. The models
@@ -122,6 +139,8 @@ var defaultModelsPerGPU = 3
 
 var ErrMaxQueue = errors.New("server busy, please try again.  maximum pending requests exceeded")
 
+var ErrDraining = errors.New("server is draining, please try again later")
+
 func InitScheduler(ctx context.Context) *Scheduler {
 	maxQueue := envconfig.MaxQueue()
 	sched := &Scheduler{
@@ -130,10 +149,17 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		expiredCh:       make(chan *runnerRef, maxQueue),
 		unloadedCh:      make(chan any, maxQueue),
 		loaded:          make(map[string]*runnerRef),
+		pendingModels:   make(map[string]int),
 		newServerFn:     llm.NewLlamaServer,
 		getGpuFn:        discover.GPUDevices,
 		getSystemInfoFn: discover.GetSystemInfo,
 		waitForRecovery: 5 * time.Second,
+		schedulerMetricsState: schedulerMetricsState{
+			modelPeakMemoryBytes: make(map[modelMetricKey]uint64),
+			modelEvalCount:       make(map[modelMetricKey]uint64),
+			modelEvalDuration:    make(map[modelMetricKey]uint64),
+			startTime:            time.Now(),
+		},
 	}
 	sched.loadFn = sched.load
 	return sched
@@ -174,7 +200,10 @@ func resolveContextShift(shift *bool, m *Model) bool {
 		return *shift
 	}
 
-	return supportsContextShift(m)
+	if envconfig.Shift(true) {
+		return supportsContextShift(m)
+	}
+	return false
 }
 
 func supportsContextShift(m *Model) bool {
@@ -209,7 +238,7 @@ func effectiveContext(numCtx, trainCtx int) int {
 	return numCtx
 }
 
-func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool) (chan *runnerRef, chan error) {
+func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool, authTag string) (chan *runnerRef, chan error) {
 	if opts.NumCtx < 4 {
 		opts.NumCtx = 4
 	}
@@ -234,6 +263,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 		numCtxAuto:      numCtxAuto,
 		numBatchAuto:    numBatchAuto,
 		contextShift:    contextShift,
+		authTag:         authTag,
 		shift:           shift,
 	}
 
@@ -243,9 +273,16 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	s.loadedMu.Unlock()
 	if runner != nil && !runner.needsReload(c, req) {
 		req.useLoadedRunner(runner, s.finishedReqCh)
+	} else if s.draining.Load() {
+		req.errCh <- ErrDraining
 	} else {
 		select {
 		case s.pendingReqCh <- req:
+			s.pendingMu.Lock()
+			if s.pendingModels != nil {
+				s.pendingModels[req.model.Name]++
+			}
+			s.pendingMu.Unlock()
 		default:
 			req.errCh <- ErrMaxQueue
 		}
@@ -276,6 +313,15 @@ func (s *Scheduler) processPending(ctx context.Context) {
 		case pending := <-s.pendingReqCh:
 			// Block other requests until we get this pending request running
 			pending.schedAttempts++
+
+			s.pendingMu.Lock()
+			if s.pendingModels != nil {
+				s.pendingModels[pending.model.Name]--
+				if s.pendingModels[pending.model.Name] <= 0 {
+					delete(s.pendingModels, pending.model.Name)
+				}
+			}
+			s.pendingMu.Unlock()
 
 			if pending.ctx.Err() != nil {
 				slog.Debug("pending request cancelled or timed out, skipping scheduling")
@@ -317,9 +363,19 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					} else {
 						logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
 						gpus = s.getGpuFn(ctx, runnersSnapshot)
+						s.cachedGpusMu.Lock()
+						s.cachedGpus = gpus
+						s.cachedGpusMu.Unlock()
 					}
 					logutil.Trace("refreshing system information", "model", pending.model.ModelPath)
 					systemInfo := s.getSystemInfoFn()
+					s.cachedSysMemMu.Lock()
+					s.cachedSysMem = systemMemorySnapshot{
+						totalMemory: systemInfo.TotalMemory,
+						freeMemory:  systemInfo.FreeMemory,
+						freeSwap:    systemInfo.FreeSwap,
+					}
+					s.cachedSysMemMu.Unlock()
 					if maxRunners <= 0 {
 						// No user specified MaxRunners, so figure out what automatic setting to use for the next load attempt
 						if pending.opts.NumGPU == 0 {
@@ -385,6 +441,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					runnerToExpire.expireTimer = nil
 				}
 				runnerToExpire.sessionDuration = 0
+				runnerToExpire.expiring = true
 				if runnerToExpire.refCount <= 0 {
 					s.expiredCh <- runnerToExpire
 				}
@@ -491,6 +548,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				slog.Debug("orphaned runner shutting down", "orphan", runner, "loaded", runnerToUnload)
 				runner.unload()
 				s.loadedMu.Unlock()
+				s.recordModelUnload(runner.modelName, runner.authTag)
 				runner.refMu.Unlock()
 			} else {
 				slog.Debug("starting background wait for VRAM recovery", "runner", runner)
@@ -502,6 +560,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				runner.unload()
 				delete(s.loaded, runner.modelKey)
 				s.loadedMu.Unlock()
+				s.recordModelUnload(runner.modelName, runner.authTag)
 				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
 				<-finished
 				runner.refMu.Unlock()
@@ -523,13 +582,13 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 		runner.expireTimer.Stop()
 		runner.expireTimer = nil
 	}
-	if pending.sessionDuration != nil {
+	if pending.sessionDuration != nil && !runner.expiring {
 		runner.sessionDuration = pending.sessionDuration.Duration
 	}
 	pending.successCh <- runner
 	go func() {
 		<-pending.ctx.Done()
-		slog.Debug("context for request finished", "runner", runner)
+		slog.DebugContext(pending.ctx, "context for request finished", "runner", runner)
 		finished <- pending
 	}()
 }
@@ -537,12 +596,19 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
-	numParallel := max(int(envconfig.NumParallel()), 1)
+	numParallel := max(req.opts.NumParallel, 1)
 	completion := req.model.CheckCapabilities(model.CapabilityCompletion) == nil
 
 	// Embedding models should always be loaded with parallel=1
 	if !completion {
 		numParallel = 1
+	}
+
+	// Some architectures are not safe with num_parallel > 1.
+	// ref: https://github.com/ollama/ollama/issues/4165
+	if slices.Contains([]string{"mllama", "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe", "qwen3next", "lfm2", "lfm2moe", "nemotron_h", "nemotron_h_moe", "nemotron_h_omni"}, req.model.Config.ModelFamily) && numParallel != 1 {
+		numParallel = 1
+		slog.WarnContext(req.ctx, "model architecture does not currently support parallel requests", "architecture", req.model.Config.ModelFamily)
 	}
 
 	sessionDuration := envconfig.KeepAlive()
@@ -562,7 +628,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			var loadErr error
 			f, loadErr = llm.LoadModel(req.model.ModelPath, 1024, req.model.ModelShardPaths...)
 			if loadErr != nil {
-				slog.Info("failed to load model metadata", "model", req.model.ModelPath, "error", loadErr)
+				slog.InfoContext(req.ctx, "failed to load model metadata", "model", req.model.ModelPath, "error", loadErr)
 				req.errCh <- loadErr
 				s.loadedMu.Unlock()
 				return false
@@ -572,7 +638,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
-			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
+			flashAttention := llm.LlamaServerFlashAttentionFor(req.opts, loadGpus)
 			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
 			launchOpts.NumBatch = req.opts.NumBatch
 			var batchMemory uint64
@@ -586,7 +652,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				freeMemory, gpuFreeMemory, systemLimited := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 				// Use 80% of free memory as threshold to leave headroom.
 				if predictedForLoad > freeMemory*80/100 {
-					slog.Info("llama-server model predicted to exceed available memory, evicting",
+					slog.InfoContext(req.ctx, "llama-server model predicted to exceed available memory, evicting",
 						"predicted", format.HumanBytes2(predictedForLoad),
 						"predicted_num_ctx", predictedCtx,
 						"num_batch", launchOpts.NumBatch,
@@ -597,7 +663,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					s.loadedMu.Unlock()
 					return true
 				}
-				slog.Info("llama-server model fits alongside existing models",
+				slog.InfoContext(req.ctx, "llama-server model fits alongside existing models",
 					"predicted", format.HumanBytes2(predictedForLoad),
 					"predicted_num_ctx", predictedCtx,
 					"num_batch", launchOpts.NumBatch,
@@ -626,7 +692,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			llama, err = mlxrunner.NewClient(modelName, req.opts.NumCtx)
 		}
 		if err != nil {
-			slog.Info("failed to create server", "model", req.model.ShortName, "error", err)
+			slog.InfoContext(req.ctx, "failed to create server", "model", req.model.ShortName, "error", err)
 			req.errCh <- err
 			s.loadedMu.Unlock()
 			return false
@@ -648,14 +714,14 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	systemTotalMemory := systemInfo.TotalMemory
 	systemFreeMemory := systemInfo.FreeMemory
 	systemSwapFreeMemory := systemInfo.FreeSwap
-	slog.Info("system memory", "total", format.HumanBytes2(systemTotalMemory), "free", format.HumanBytes2(systemFreeMemory), "free_swap", format.HumanBytes2(systemSwapFreeMemory))
+	slog.InfoContext(req.ctx, "system memory", "total", format.HumanBytes2(systemTotalMemory), "free", format.HumanBytes2(systemFreeMemory), "free_swap", format.HumanBytes2(systemSwapFreeMemory))
 
 	for _, gpu := range loadGpus {
 		available := gpu.FreeMemory - envconfig.GpuOverhead() - gpu.MinimumMemory()
 		if gpu.FreeMemory < envconfig.GpuOverhead()+gpu.MinimumMemory() {
 			available = 0
 		}
-		slog.Info("gpu memory", "id", gpu.ID, "library", gpu.Library,
+		slog.InfoContext(req.ctx, "gpu memory", "id", gpu.ID, "library", gpu.Library,
 			"available", format.HumanBytes2(available),
 			"free", format.HumanBytes2(gpu.FreeMemory),
 			"minimum", format.HumanBytes2(gpu.MinimumMemory()),
@@ -667,7 +733,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		if errors.Is(err, llm.ErrLoadRequiredFull) {
 			if !requireFull {
 				// No other models loaded, yet we still don't fit, so report an error
-				slog.Info("model is too large for system memory", "requireFull", requireFull)
+				slog.InfoContext(req.ctx, "model is too large for system memory", "requireFull", requireFull)
 				s.activeLoading.Close()
 				s.activeLoading = nil
 				req.errCh <- err
@@ -676,7 +742,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			return true
 		}
 
-		slog.Info("Load failed", "model", req.model.ModelPath, "error", err)
+		slog.InfoContext(req.ctx, "Load failed", "model", req.model.ModelPath, "error", err)
 		s.activeLoading.Close()
 		s.activeLoading = nil
 
@@ -687,7 +753,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		if !req.oomRetryAttempted && llm.IsOutOfMemory(err) {
 			if oldNumCtx, effectiveNumCtx, newNumCtx, oldNumBatch, newNumBatch, ok := req.reduceAutoNumCtxForLoadOOM(f, numParallel, completion, systemInfo, loadGpus, launchOpts); ok {
 				req.oomRetryAttempted = true
-				slog.Warn("llama-server load failed; reducing automatic context and retrying once",
+				slog.WarnContext(req.ctx, "llama-server load failed; reducing automatic context and retrying once",
 					"model", req.model.ModelPath,
 					"old_num_ctx", oldNumCtx,
 					"effective_num_ctx", effectiveNumCtx,
@@ -702,7 +768,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		}
 		if otherLoaded && !req.oomRetryAttempted && llm.IsOutOfMemory(err) {
 			req.oomRetryAttempted = true
-			slog.Warn("llama-server load failed; evicting all other models and retrying once", "model", req.model.ModelPath, "error", err)
+			slog.WarnContext(req.ctx, "llama-server load failed; evicting all other models and retrying once", "model", req.model.ModelPath, "error", err)
 			return true
 		}
 
@@ -742,6 +808,7 @@ iGPUScan:
 	runner := &runnerRef{
 		modelPath:       req.model.ModelPath,
 		modelKey:        schedulerModelKey(req.model),
+		modelName:       req.model.ShortName,
 		llama:           llama,
 		Options:         &req.opts,
 		sessionDuration: sessionDuration,
@@ -757,6 +824,7 @@ iGPUScan:
 		useMMapAuto:     req.useMMapAuto,
 		contextShift:    req.contextShift,
 		trainContext:    trainContext,
+		authTag:         req.authTag,
 	}
 	runner.model.Store(req.model)
 	runner.numParallel = numParallel
@@ -765,26 +833,27 @@ iGPUScan:
 	s.loadedMu.Lock()
 	if oldRunner, ok := s.loaded[runner.modelKey]; ok {
 		// Shouldn't happen, but safeguard against leaking a runner
-		slog.Warn("model was still loaded", "old_runner", oldRunner, "new_runner", runner)
+		slog.WarnContext(req.ctx, "model was still loaded", "old_runner", oldRunner, "new_runner", runner)
 		oldRunner.refMu.Lock()
 		oldRunner.unload()
 		oldRunner.refMu.Unlock()
 	}
 	s.activeLoading = nil
 	s.loaded[runner.modelKey] = runner
-	slog.Info("loaded runners", "count", len(s.loaded))
+	slog.InfoContext(req.ctx, "loaded runners", "count", len(s.loaded))
 	s.loadedMu.Unlock()
+	s.recordModelLoad(runner.modelName, req.authTag)
 
 	go func() {
 		defer runner.refMu.Unlock()
 		if err = llama.WaitUntilRunning(req.ctx); err != nil {
-			slog.Error("error loading llama server", "error", err)
+			slog.ErrorContext(req.ctx, "error loading llama server", "error", err)
 			req.errCh <- err
-			slog.Debug("triggering expiration for failed load", "runner", runner)
+			slog.DebugContext(req.ctx, "triggering expiration for failed load", "runner", runner)
 			s.expiredCh <- runner
 			return
 		}
-		slog.Debug("finished setting up", "runner", runner)
+		slog.DebugContext(req.ctx, "finished setting up", "runner", runner)
 		if runner.pid < 0 {
 			runner.pid = llama.Pid()
 		}
@@ -792,7 +861,7 @@ iGPUScan:
 		runner.loading = false
 		go func() {
 			<-req.ctx.Done()
-			slog.Debug("context for request finished")
+			slog.DebugContext(req.ctx, "context for request finished")
 			s.finishedReqCh <- req
 		}()
 		req.successCh <- runner
@@ -824,7 +893,7 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
 	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
-	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttention(gpus), gpus)
+	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttentionFor(req.opts, gpus), gpus)
 	newNumBatch = req.opts.NumBatch
 	return oldNumCtx, effectiveNumCtx, newNumCtx, oldNumBatch, newNumBatch, true
 }
@@ -1384,17 +1453,20 @@ type runnerRef struct {
 	sessionDuration time.Duration
 	expireTimer     *time.Timer
 	expiresAt       time.Time
+	expiring        bool
 
 	// model is atomic so lookups can read it without contending on refMu.
 	model        atomic.Pointer[Model]
 	modelPath    string
 	modelKey     string
+	modelName    string
 	numParallel  int
 	numCtxAuto   bool
 	numBatchAuto bool
 	useMMapAuto  bool
 	contextShift bool
 	trainContext int
+	authTag      string
 	*api.Options
 }
 
@@ -1414,7 +1486,7 @@ func (runner *runnerRef) unload() {
 }
 
 func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool {
-	slog.Debug("evaluating already loaded", "model", schedulerModelKey(req.model))
+	slog.DebugContext(ctx, "evaluating already loaded", "model", schedulerModelKey(req.model))
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 
@@ -1459,6 +1531,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	if loaded == nil ||
 		!reflect.DeepEqual(loaded.AdapterPaths, req.model.AdapterPaths) || // have the adapters changed?
 		!reflect.DeepEqual(loaded.ProjectorPaths, req.model.ProjectorPaths) || // have the projectors changed?
+		loaded.Config.Jinja != req.model.Config.Jinja || // has the jinja template changed?
 		(!loaded.IsMLX() && !reflect.DeepEqual(optsExisting, optsNew)) || // have the runner options changed?
 		runner.llama.Ping(ctx) != nil {
 		return true
@@ -1653,6 +1726,7 @@ func (s *Scheduler) evictAllAndWait(ctx context.Context, keepKey string) bool {
 			runner.expireTimer = nil
 		}
 		runner.sessionDuration = 0
+		runner.expiring = true
 		if runner.refCount <= 0 {
 			s.expiredCh <- runner
 		}
@@ -1696,6 +1770,7 @@ func (s *Scheduler) expireRunnersForRuntimeOOM(model *Model, err error) {
 			runner.expireTimer = nil
 		}
 		runner.sessionDuration = 0
+		runner.expiring = true
 		if runner.refCount <= 0 {
 			s.expiredCh <- runner
 		}
@@ -1777,6 +1852,7 @@ func (s *Scheduler) expireRunner(model *Model) {
 			runner.expireTimer = nil
 		}
 		runner.sessionDuration = 0
+		runner.expiring = true
 		if runner.refCount <= 0 {
 			s.expiredCh <- runner
 		}
@@ -1839,4 +1915,178 @@ func (s *Scheduler) loadedModels() []loadedModel {
 		models = append(models, lm)
 	}
 	return models
+}
+
+// healthCheck pings each loaded runner and returns per-runner health status.
+// It follows the same lock-ordering rules as loadedModels: snapshot under
+// loadedMu, release it, then acquire each refMu individually.
+func (s *Scheduler) healthCheck(ctx context.Context) []api.HealthModel {
+	s.loadedMu.Lock()
+	runners := make([]*runnerRef, 0, len(s.loaded))
+	for _, r := range s.loaded {
+		runners = append(runners, r)
+	}
+	s.loadedMu.Unlock()
+
+	results := make([]api.HealthModel, 0, len(runners))
+	for _, r := range runners {
+		r.refMu.Lock()
+		m := r.model.Load()
+		if m == nil {
+			r.refMu.Unlock()
+			continue
+		}
+
+		hm := api.HealthModel{
+			Name:   m.Name,
+			Digest: m.Digest,
+			Pid:    r.pid,
+		}
+
+		if r.llama == nil {
+			hm.Status = "unhealthy"
+			hm.Message = "runner not initialized"
+			r.refMu.Unlock()
+			results = append(results, hm)
+			continue
+		}
+
+		hm.Port = r.llama.GetPort()
+
+		if r.loading {
+			hm.Status = "loading"
+			hm.Message = "model is loading"
+			r.refMu.Unlock()
+			results = append(results, hm)
+			continue
+		}
+
+		if r.llama.HasExited() {
+			hm.Status = "unhealthy"
+			hm.Message = "runner process has exited"
+			r.refMu.Unlock()
+			results = append(results, hm)
+			continue
+		}
+
+		// Release refMu before the potentially blocking Ping call
+		llama := r.llama
+		r.refMu.Unlock()
+
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := llama.Ping(pingCtx); err != nil {
+			hm.Status = "unhealthy"
+			hm.Message = err.Error()
+		} else {
+			hm.Status = "ok"
+		}
+		cancel()
+		results = append(results, hm)
+	}
+	return results
+}
+
+// gracefulUnloadAllRunners sets sessionDuration to zero and marks every loaded
+// runner as expiring so that each one unloads as soon as its last in-flight
+// request completes. Idle runners (refCount == 0) are expired immediately.
+// The method polls until all runners are unloaded, the context is cancelled,
+// or timeout elapses.
+//
+// The per-runner expiring flag prevents queued requests from resetting
+// sessionDuration via keep_alive, so there is no need to wait for the pending
+// queue to empty first. This should be called after enabling drain mode;
+// otherwise new requests may keep runners busy indefinitely.
+func (s *Scheduler) gracefulUnloadAllRunners(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Set sessionDuration=0 and expiring=true on all runners; expire idle ones.
+	s.loadedMu.Lock()
+	runners := make([]*runnerRef, 0, len(s.loaded))
+	for _, runner := range s.loaded {
+		runners = append(runners, runner)
+	}
+	s.loadedMu.Unlock()
+
+	if len(runners) == 0 {
+		return nil
+	}
+
+	slog.Info("graceful unload started", "runners", len(runners))
+	for _, runner := range runners {
+		runner.refMu.Lock()
+		if runner.expireTimer != nil {
+			runner.expireTimer.Stop()
+			runner.expireTimer = nil
+		}
+		runner.sessionDuration = 0
+		runner.expiring = true
+		if runner.refCount <= 0 {
+			s.expiredCh <- runner
+		}
+		runner.refMu.Unlock()
+	}
+
+	// Wait for all runners to unload.
+	for {
+		s.loadedMu.Lock()
+		remaining := len(s.loaded)
+		s.loadedMu.Unlock()
+
+		if remaining == 0 {
+			slog.Info("graceful unload complete")
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			slog.Warn("graceful unload timed out", "remaining", remaining)
+			return fmt.Errorf("timed out waiting for %d runners to unload", remaining)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// SetDraining enables or disables drain mode. When enabled, new requests that
+// cannot be served by an already-loaded runner are rejected with ErrDraining.
+// In-flight requests and already-queued requests continue to be processed.
+func (s *Scheduler) SetDraining(draining bool) {
+	old := s.draining.Swap(draining)
+	if old == draining {
+		return
+	}
+	if draining {
+		slog.Info("scheduler drain mode enabled")
+	} else {
+		slog.Info("scheduler drain mode disabled")
+	}
+}
+
+// IsDraining returns whether the scheduler is currently in drain mode.
+func (s *Scheduler) IsDraining() bool {
+	return s.draining.Load()
+}
+
+// PendingQueueDepth returns the total number of requests waiting in the
+// pending queue. This is a snapshot and may change between the call and
+// the caller's use of the value.
+func (s *Scheduler) PendingQueueDepth() int {
+	return len(s.pendingReqCh)
+}
+
+// PendingByModel returns a snapshot of the pending queue broken out by
+// model name. The map is a copy; callers may freely mutate it.
+func (s *Scheduler) PendingByModel() map[string]int {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	result := make(map[string]int, len(s.pendingModels))
+	for k, v := range s.pendingModels {
+		result[k] = v
+	}
+	return result
 }

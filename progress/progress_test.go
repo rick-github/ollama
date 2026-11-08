@@ -3,6 +3,7 @@ package progress
 import (
 	"bytes"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -43,6 +44,23 @@ func TestStopStopsRendering(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // several tick intervals
 	if buf.Len() != settled {
 		t.Fatalf("render loop still writing after Stop: %d -> %d bytes", settled, buf.Len())
+	}
+}
+
+// TestNonTerminalEmitsNoAnsi verifies that when the writer is not an
+// interactive terminal (e.g. a pipe or file), the progress renderer emits no
+// ANSI escape sequences — neither cursor hide/show, synchronized-output, nor
+// cursor movement/clear controls — and no spinner frames.
+func TestNonTerminalEmitsNoAnsi(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewProgress(&buf)
+	p.Add("spin", NewSpinner("working"))
+	time.Sleep(350 * time.Millisecond) // several render ticks
+	p.StopAndClear()
+
+	out := buf.String()
+	if strings.ContainsAny(out, "\x1b") {
+		t.Fatalf("non-terminal output contains ANSI escape sequences:\n%q", out)
 	}
 }
 

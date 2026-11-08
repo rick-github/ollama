@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  - job_name: ollama
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["host.docker.internal:11434"]
+        labels:
+          host: ollama
+    metrics_path: /metrics
+    # If OLLAMA_API_KEY is set on the ollama server, uncomment and set
+    # the matching bearer token here:
+    # bearer_token: your-api-key
+
+  - job_name: pricing-scraper
+    scrape_interval: 60s
+    static_configs:
+      - targets: ["pricing-scraper:9100"]
+    metrics_path: /metrics

@@ -408,7 +408,8 @@ curl http://localhost:11434/api/generate -d '{
     "num_gpu": 1,
     "main_gpu": 0,
     "use_mmap": true,
-    "num_thread": 8
+    "num_thread": 8,
+    "args": ["--image-max-tokens", "4096"]
   }
 }'
 ```
@@ -1870,3 +1871,63 @@ curl http://localhost:11434/api/version
   "version": "0.5.1"
 }
 ```
+
+## Metrics
+
+```
+GET /metrics
+```
+
+Expose server metrics in the [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/). Disabled by default; set the `OLLAMA_METRICS` environment variable to enable the endpoint.
+
+Per-user metrics include an `auth` label derived from the request's `Authorization` header. The token is truncated to a short prefix so the full token is not exposed in metric labels. Set `OLLAMA_METRICS_DISABLE_AUTH` to suppress the auth label entirely (all requests are labeled `anon`).
+
+### Examples
+
+#### Request
+
+```shell
+curl http://localhost:11434/metrics
+```
+
+#### Response
+
+```
+# HELP ollama_requests_queued Number of requests waiting for a model runner.
+# TYPE ollama_requests_queued gauge
+ollama_requests_queued 0
+# HELP ollama_queue_capacity Maximum number of requests that can be queued (OLLAMA_MAX_QUEUE).
+# TYPE ollama_queue_capacity gauge
+ollama_queue_capacity 512
+# HELP ollama_models_loaded Number of models currently loaded in memory.
+# TYPE ollama_models_loaded gauge
+ollama_models_loaded 1
+# HELP ollama_build_info Ollama build information.
+# TYPE ollama_build_info gauge
+ollama_build_info{version="0.0.0"} 1719990000
+# HELP http_requests_total The total number of requests on the endpoints.
+# TYPE http_requests_total counter
+http_requests_total{action="generate",status="OK",status_code="200"} 2.000000
+# HELP ollama_peak_memory_bytes The peak memory used during computation in bytes.
+# TYPE ollama_peak_memory_bytes gauge
+ollama_peak_memory_bytes{model="llama3",reason="stop"} 123456
+# HELP ollama_total_duration_seconds The request total duration in seconds.
+# TYPE ollama_total_duration_seconds counter
+ollama_total_duration_seconds{model="llama3",reason="stop"} 12.5
+# HELP ollama_load_duration_seconds The request load duration in seconds.
+# TYPE ollama_load_duration_seconds counter
+ollama_load_duration_seconds{model="llama3",reason="stop"} 3.1
+# HELP ollama_prompt_eval_total The number of prompt token evaluated.
+# TYPE ollama_prompt_eval_total counter
+ollama_prompt_eval_total{model="llama3",reason="stop"} 112
+# HELP ollama_prompt_eval_duration_seconds The prompt evaluation duration in seconds.
+# TYPE ollama_prompt_eval_duration_seconds counter
+ollama_prompt_eval_duration_seconds{model="llama3",reason="stop"} 0.42
+# HELP ollama_eval_total The number of token evaluated.
+# TYPE ollama_eval_total counter
+ollama_eval_total{model="llama3",reason="stop"} 42
+# HELP ollama_eval_duration_seconds The token evaluation duration in seconds.
+# TYPE ollama_eval_duration_seconds counter
+ollama_eval_duration_seconds{model="llama3",reason="stop"} 1.3
+```
+

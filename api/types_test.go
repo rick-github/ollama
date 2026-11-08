@@ -1017,6 +1017,34 @@ func TestValidateLegacyThinking(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("custom_levels", func(t *testing.T) {
+		for _, tt := range []struct {
+			name   string
+			input  string
+			levels []string
+			valid  bool
+		}{
+			{"custom level accepted", `"no_think"`, []string{"high", "no_think"}, true},
+			{"custom level rejected", `"low"`, []string{"high", "no_think"}, false},
+			{"default level rejected when custom set", `"low"`, []string{"high"}, false},
+			{"empty custom accepts nothing", `"low"`, []string{}, false},
+			{"bool accepted when in custom levels", `true`, []string{"true"}, true},
+			{"bool rejected when not in custom levels", `false`, []string{"true"}, false},
+			{"bool false accepted when both levels set", `false`, []string{"true", "false"}, true},
+			{"nil still accepted with custom", `null`, []string{"high"}, true},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				var think *ThinkValue
+				if err := json.Unmarshal([]byte(tt.input), &think); err != nil {
+					t.Fatal(err)
+				}
+				if err := ValidateLegacyThinking(think, tt.levels...); (err == nil) != tt.valid {
+					t.Fatalf("ValidateLegacyThinking(%s, %v) = %v, want valid=%v", tt.input, tt.levels, err, tt.valid)
+				}
+			})
+		}
+	})
 }
 
 func TestThinkValueTransportTypes(t *testing.T) {

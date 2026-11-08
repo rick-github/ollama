@@ -214,11 +214,17 @@ func (m *Model) ggufCapabilities(capabilities []model.Capability, source templat
 
 	switch source {
 	case templateCapabilitySelected:
-		if !usesOllamaRenderedChat(m) {
+		if m.Config.Jinja != "" {
+			capabilities = chatTemplateCapabilities(capabilities, m.Config.Jinja)
+		} else if !usesOllamaRenderedChat(m) {
 			capabilities = chatTemplateCapabilities(capabilities, m.metadata.String("tokenizer.chat_template"))
 		}
 	case templateCapabilityChat:
-		capabilities = chatTemplateCapabilities(capabilities, m.metadata.String("tokenizer.chat_template"))
+		if m.Config.Jinja != "" {
+			capabilities = chatTemplateCapabilities(capabilities, m.Config.Jinja)
+		} else {
+			capabilities = chatTemplateCapabilities(capabilities, m.metadata.String("tokenizer.chat_template"))
+		}
 	}
 	switch {
 	case m.metadata.String("decision.type") != "":
@@ -382,6 +388,8 @@ func (m *Model) templateSource() string {
 
 func selectedTemplateSource(m *Model, usesHarmony bool) string {
 	switch {
+	case m.Config.Jinja != "":
+		return "jinja"
 	case m.Config.Renderer != "" && m.Config.Parser != "":
 		return "renderer_parser"
 	case m.Config.Renderer != "":
@@ -704,6 +712,13 @@ func (m *Model) String() string {
 		})
 	}
 
+	if m.Config.Jinja != "" {
+		modelfile.Commands = append(modelfile.Commands, parser.Command{
+			Name: "jinja",
+			Args: m.Config.Jinja,
+		})
+	}
+
 	for k, v := range m.Options {
 		switch v := v.(type) {
 		case []any:
@@ -896,14 +911,18 @@ func modelFromManifest(n model.Name, mf *manifest.Manifest) (*Model, error) {
 		}
 	}
 
-	ggufCaps := chatTemplateCapabilities(nil, ggufChatTemplate)
+	chatTemplateForCaps := ggufChatTemplate
+	if m.Config.Jinja != "" {
+		chatTemplateForCaps = m.Config.Jinja
+	}
+	ggufCaps := chatTemplateCapabilities(nil, chatTemplateForCaps)
 	goCaps := goTemplateCapabilities(m.Template)
 	usesHarmony := m.Template != nil && shouldUseHarmony(m)
-	if !goTemplateEnvSet() && m.HasGoTemplate && ggufChatTemplate != "" && m.Config.Renderer == "" && m.Config.Parser == "" && !usesHarmony && shouldPreferChatTemplate(ggufChatTemplate, ggufCaps, m.Template, goCaps) {
+	if !goTemplateEnvSet() && m.HasGoTemplate && ggufChatTemplate != "" && m.Config.Renderer == "" && m.Config.Parser == "" && m.Config.Jinja == "" && !usesHarmony && shouldPreferChatTemplate(ggufChatTemplate, ggufCaps, m.Template, goCaps) {
 		m.PreferChatTemplate = true
 	}
 
-	if m.ModelPath != "" && m.isGGUF() && !modelHasPooling && !m.HasChatTemplate && (!m.HasGoTemplate || !envconfig.GoTemplate(true)) && m.Config.Renderer == "" && m.Config.Parser == "" && !usesHarmony && m.metadata.String("decision.type") == "" {
+	if m.ModelPath != "" && m.isGGUF() && !modelHasPooling && !m.HasChatTemplate && m.Config.Jinja == "" && (!m.HasGoTemplate || !envconfig.GoTemplate(true)) && m.Config.Renderer == "" && m.Config.Parser == "" && !usesHarmony && m.metadata.String("decision.type") == "" {
 		slog.Warn("model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted", "model", m.Name, "env", "OLLAMA_GO_TEMPLATE=1")
 	}
 

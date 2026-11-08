@@ -91,6 +91,24 @@ func (m *Model) Thinking() *model.Thinking {
 			return thinking.Clone()
 		}
 	}
+	if levels := thinkLevelsFromOptions(m.Options); levels != nil && slices.Contains(m.Capabilities(), model.CapabilityThinking) {
+		values := make([]any, len(levels))
+		for i, l := range levels {
+			switch l {
+			case "true":
+				values[i] = true
+			case "false":
+				values[i] = false
+			default:
+				values[i] = l
+			}
+		}
+		thinking := &model.Thinking{Values: values}
+		if len(values) > 0 {
+			thinking.Default = values[0]
+		}
+		return thinking
+	}
 	return nil
 }
 

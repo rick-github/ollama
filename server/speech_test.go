@@ -163,6 +163,7 @@ func TestSpeechScheduleErrors(t *testing.T) {
 		{manifest.ErrNoCompatibleManifest, 400, manifest.ErrNoCompatibleManifest.Error()},
 		{context.Canceled, 499, "request canceled"},
 		{ErrMaxQueue, 503, ErrMaxQueue.Error()},
+		{ErrDraining, 503, ErrDraining.Error()},
 		{os.ErrNotExist, 404, `model "phonon" not found, try pulling it first`},
 		{errors.New("load failed"), 500, "load failed"},
 	} {

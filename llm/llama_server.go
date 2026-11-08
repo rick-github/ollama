@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -124,6 +125,10 @@ func LlamaServerBatchMemory(batch int) uint64 {
 func boundedNumPredict(numPredict, numCtx int) int {
 	if numCtx <= 0 {
 		return numPredict
+	}
+	// num_predict==-2 means "fill the context buffer", limit to context size.
+	if numPredict == -2 {
+		return numCtx
 	}
 	// Ollama's default num_predict=-1 means "generate until a stop condition".
 	// llama-server still needs a finite request budget, so keep open-ended
@@ -341,7 +346,7 @@ func (s *llamaServerRunner) completionPromptForRequest(ctx context.Context, req 
 	truncated = append(truncated, tokens[:nKeep]...)
 	truncated = append(truncated, tokens[nKeep+discard:]...)
 
-	slog.Warn("truncating input prompt", "limit", limit, "prompt", len(tokens), "keep", nKeep, "new", len(truncated))
+	slog.WarnContext(ctx, "truncating input prompt", "limit", limit, "prompt", len(tokens), "keep", nKeep, "new", len(truncated))
 	return truncated, nil
 }
 
@@ -359,6 +364,56 @@ func contextShiftPromptLimit(numCtx, numKeep int) int {
 
 func (s *llamaServerRunner) ContextLength() int {
 	return s.options.NumCtx
+}
+
+// RunnerOptions returns the runner's current options as a map keyed by JSON
+// tag. Reflection is used so that changes to api.Runner are automatically
+// inherited without requiring updates here.
+func (s *llamaServerRunner) RunnerOptions() map[string]any {
+	options := map[string]any{}
+	t := reflect.TypeOf(s.options.Runner)
+	v := reflect.ValueOf(s.options.Runner)
+	for _, field := range reflect.VisibleFields(t) {
+		jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
+		if jsonTag == "" || jsonTag == "-" {
+			continue
+		}
+		fv := v.FieldByIndex(field.Index)
+		switch fv.Kind() {
+		case reflect.Int:
+			options[jsonTag] = fv.Int()
+		case reflect.String:
+			if s := fv.String(); s != "" {
+				options[jsonTag] = s
+			}
+		case reflect.Pointer:
+			if fv.IsNil() {
+				continue
+			}
+			// Skip main_gpu — it's set by the placement logic during load,
+			// not by the user, and the loaded runner's Options.Runner.MainGPU
+			// may differ from the launch config's MainGPU.
+			if jsonTag == "main_gpu" {
+				continue
+			}
+			switch fv.Elem().Kind() {
+			case reflect.Bool:
+				b := fv.Elem().Bool()
+				options[jsonTag] = b
+			case reflect.Int:
+				options[jsonTag] = fv.Elem().Int()
+			}
+		case reflect.Slice:
+			if fv.Len() > 0 {
+				slice := make([]string, fv.Len())
+				for i := range fv.Len() {
+					slice[i] = fv.Index(i).String()
+				}
+				options[jsonTag] = slice
+			}
+		}
+	}
+	return options
 }
 
 // FindLlamaServer locates the llama-server binary in lib/ollama/.
@@ -426,10 +481,16 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	// KV cache type
 	if launch.kvCacheType != "" {
-		params = append(params, "--cache-type-k", launch.kvCacheType, "--cache-type-v", launch.kvCacheType)
+		k, v := splitKvCacheType(launch.kvCacheType)
+		if k != "" {
+			params = append(params, "--cache-type-k", k)
+		}
+		if v != "" {
+			params = append(params, "--cache-type-v", v)
+		}
 	}
 
-	params = appendFlashAttentionArgs(params, launch.gpus)
+	params = appendFlashAttentionArgsFor(params, launch.opts, launch.gpus)
 
 	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
 
@@ -452,6 +513,12 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	params = appendMainGPUArgs(params, launch.opts)
 
 	params = appendContextShiftArgs(params, launch.opts, launch.config.ContextShift)
+
+	// Extra runner arguments passed through from the request/model options.
+	// They are appended verbatim after Ollama's own flags so that conflicting
+	// values override earlier ones (llama-server generally follows last-wins
+	// semantics for repeated flags).
+	params = appendArgs(params, launch.opts)
 
 	// Set up library paths for GPU backend discovery
 	cmd = exec.Command(exe, params...)
@@ -618,6 +685,22 @@ func appendLlamaServerLogArgs(params []string) []string {
 	)
 }
 
+// splitKvCacheType splits a kv_cache_type string into the K and V
+// components for --cache-type-k and --cache-type-v. A single value
+// (e.g. "q8_0") is applied to both; a comma-separated pair "k,v"
+// (e.g. "q8_0,f16") sets them independently. An empty element
+// preserves the runner default for that side.
+func splitKvCacheType(s string) (string, string) {
+	parts := strings.Split(s, ",")
+	for i := range parts {
+		parts[i] = strings.ToLower(strings.TrimSpace(parts[i]))
+	}
+	if len(parts) == 1 {
+		return parts[0], parts[0]
+	}
+	return parts[0], parts[1]
+}
+
 func appendBatchArgs(params []string, opts api.Options, embedding bool, numParallel int) []string {
 	if embedding {
 		params = append(params, "--embedding")
@@ -635,6 +718,20 @@ func appendBatchArgs(params []string, opts api.Options, embedding bool, numParal
 
 // LlamaServerFlashAttention resolves the flash-attention mode passed to llama-server.
 func LlamaServerFlashAttention(gpus []ml.DeviceInfo) ml.FlashAttentionType {
+	return LlamaServerFlashAttentionFor(api.Options{}, gpus)
+}
+
+// LlamaServerFlashAttentionFor resolves the flash-attention mode for a given
+// model's options. A non-nil opts.FlashAttention overrides the global
+// OLLAMA_FLASH_ATTENTION env var; a nil value preserves the existing
+// env-based / auto-detection behaviour.
+func LlamaServerFlashAttentionFor(opts api.Options, gpus []ml.DeviceInfo) ml.FlashAttentionType {
+	if opts.FlashAttention != nil {
+		if *opts.FlashAttention {
+			return ml.FlashAttentionEnabled
+		}
+		return ml.FlashAttentionDisabled
+	}
 	enabled := envconfig.FlashAttention(false)
 	userSet := enabled == envconfig.FlashAttention(true)
 	if userSet {
@@ -652,6 +749,20 @@ func LlamaServerFlashAttention(gpus []ml.DeviceInfo) ml.FlashAttentionType {
 
 func appendFlashAttentionArgs(params []string, gpus []ml.DeviceInfo) []string {
 	switch LlamaServerFlashAttention(gpus) {
+	case ml.FlashAttentionEnabled:
+		return append(params, "--flash-attn", "on")
+	case ml.FlashAttentionDisabled:
+		return append(params, "--flash-attn", "off")
+	default:
+		return append(params, "--flash-attn", "auto")
+	}
+}
+
+// appendFlashAttentionArgsFor is the per-model variant of
+// appendFlashAttentionArgs. It consults opts.FlashAttention before falling
+// back to the global env var / auto detection.
+func appendFlashAttentionArgsFor(params []string, opts api.Options, gpus []ml.DeviceInfo) []string {
+	switch LlamaServerFlashAttentionFor(opts, gpus) {
 	case ml.FlashAttentionEnabled:
 		return append(params, "--flash-attn", "on")
 	case ml.FlashAttentionDisabled:
@@ -819,6 +930,13 @@ func appendJinjaArgs(params []string, config LlamaServerConfig) []string {
 		return append(params, "--no-jinja", "--chat-template", "chatml")
 	}
 
+	if config.ChatTemplate != "" {
+		// A custom Jinja template from the Modelfile overrides the GGUF embedded
+		// template. --jinja enables jinja processing and --chat-template passes
+		// the template string directly.
+		return append(params, "--jinja", "--chat-template", config.ChatTemplate)
+	}
+
 	return params
 }
 
@@ -833,6 +951,56 @@ func appendContextShiftArgs(params []string, opts api.Options, enabled bool) []s
 	}
 
 	return params
+}
+
+// appendArgs forwards user-supplied runner arguments onto the
+// llama-server command line. They are appended last so that, for flags
+// llama-server accepts repeatedly, the user's value overrides Ollama's own.
+//
+// llama-server's argument parser does not accept the --flag=value form — only
+// space-separated tokens — so tokens that look like a flag (start with "-")
+// and contain "=" are split into two argv entries. This lets users write the
+// more intuitive "--image-max-tokens=4096" while still producing the
+// "--image-max-tokens", "4096" that llama-server expects.
+func appendArgs(params []string, opts api.Options) []string {
+	if len(opts.Args) == 0 {
+		return params
+	}
+	args := normalizeArgs(opts.Args)
+	slog.Info("appending extra llama-server arguments from options", "args", args)
+	return append(params, args...)
+}
+
+// normalizeArgs splits "--flag=value" tokens into ["--flag", "value"] so
+// they conform to llama-server's space-separated argv convention. Tokens that
+// don't start with "-" (positional values) are never split, even if they
+// contain "=". Only the first "=" in a token is split, so
+// "--key=a=b" becomes ["--key", "a=b"].
+func normalizeArgs(args []string) []string {
+	out := make([]string, 0, len(args)+2)
+	for _, a := range args {
+		if flag, value, ok := splitFlagValue(a); ok {
+			out = append(out, flag, value)
+		} else {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// splitFlagValue splits a token of the form "--flag=value" into ("--flag",
+// "value"). It only operates on tokens that start with "-" (a flag), and only
+// splits on the first "=". Returns ok=false for tokens without "=" or that
+// don't look like flags.
+func splitFlagValue(token string) (flag, value string, ok bool) {
+	if len(token) == 0 || token[0] != '-' {
+		return "", "", false
+	}
+	idx := strings.IndexByte(token, '=')
+	if idx < 0 {
+		return "", "", false
+	}
+	return token[:idx], token[idx+1:], true
 }
 
 const (
@@ -968,9 +1136,14 @@ func NewLlamaServerRunner(
 
 	mediaMarker := newLlamaServerMediaMarker()
 	extraEnvs := ml.GetDevicesEnv(gpus)
-	serverEnvs := make(map[string]string, len(extraEnvs)+1)
+	serverEnvs := make(map[string]string, len(extraEnvs)+1+len(opts.Env))
 	for k, v := range extraEnvs {
 		serverEnvs[k] = v
+	}
+	for _, e := range opts.Env {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			serverEnvs[k] = v
+		}
 	}
 	serverEnvs["LLAMA_MEDIA_MARKER"] = mediaMarker
 
@@ -1095,7 +1268,7 @@ func qwenVLServerArgs(modelArch string) []string {
 // health to report ready. The scheduler handles full-fit preflight for
 // llama-server before this point.
 func (s *llamaServerRunner) Load(ctx context.Context, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, _ bool) ([]ml.DeviceID, error) {
-	slog.Info("loading model via llama-server", "model", s.modelPath)
+	slog.InfoContext(ctx, "loading model via llama-server", "model", s.modelPath)
 
 	if err := s.WaitUntilRunning(ctx); err != nil {
 		retried, retryErr := s.retryWithMMProjCPUOffload(err)
@@ -1117,7 +1290,7 @@ func (s *llamaServerRunner) Load(ctx context.Context, systemInfo ml.SystemInfo, 
 	// If parsing failed (e.g., llama-server log format changed), warn so the
 	// issue is visible in logs when users report problems.
 	if len(s.gpus) > 0 && !s.hasParsedVRAM() {
-		slog.Warn("llama-server VRAM tracking: no per-device buffer sizes were parsed from "+
+		slog.WarnContext(ctx, "llama-server VRAM tracking: no per-device buffer sizes were parsed from "+
 			"llama-server logs. VRAM accounting will be inaccurate. This may indicate a "+
 			"change in llama-server's log format — check for 'buffer size' lines in the output.",
 			"model", s.modelPath, "gpus", len(s.gpus))
@@ -1249,7 +1422,7 @@ func (s *llamaServerRunner) getServerStatus(ctx context.Context) (ServerStatus, 
 	if s.cmd.ProcessState != nil {
 		msg := s.lastErrMsg()
 		if s.cmd.ProcessState.ExitCode() == -1 {
-			slog.Warn("llama-server process no longer running", "sys", s.cmd.ProcessState.Sys(), "string", s.cmd.ProcessState)
+			slog.WarnContext(ctx, "llama-server process no longer running", "sys", s.cmd.ProcessState.Sys(), "string", s.cmd.ProcessState)
 		}
 		return ServerStatusError, fmt.Errorf("llama-server process no longer running: %s %s", ExitStatus(s.cmd.ProcessState.ExitCode()), msg)
 	}
@@ -1329,7 +1502,7 @@ func (s *llamaServerRunner) getServerStatusRetry(ctx context.Context) (ServerSta
 func (s *llamaServerRunner) Ping(ctx context.Context) error {
 	_, err := s.getServerStatus(ctx)
 	if err != nil {
-		slog.Debug("llama-server unhealthy", "error", err)
+		slog.DebugContext(ctx, "llama-server unhealthy", "error", err)
 	}
 	return err
 }
@@ -1348,13 +1521,13 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 	}
 	loadDeadline := lastActivity.Add(stallTimeout)
 
-	slog.Info("waiting for llama-server to start responding")
+	slog.InfoContext(ctx, "waiting for llama-server to start responding")
 	var lastStatus ServerStatus = -1
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Warn("client connection closed before llama-server finished loading, aborting load")
+			slog.WarnContext(ctx, "client connection closed before llama-server finished loading, aborting load")
 			return fmt.Errorf("timed out waiting for llama-server to start: %w", ctx.Err())
 		case <-s.done:
 			if msg := s.lastErrMsg(); msg != "" {
@@ -1403,7 +1576,7 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 
 		statusChanged := lastStatus != status
 		if statusChanged && status != ServerStatusReady {
-			slog.Info("waiting for llama-server to become available", "status", status)
+			slog.InfoContext(ctx, "waiting for llama-server to become available", "status", status)
 		}
 		if statusChanged && status == ServerStatusLoadingModel {
 			lastActivity = time.Now()
@@ -1415,7 +1588,7 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 			if s.status != nil {
 				s.status.SetLastError("")
 			}
-			slog.Info(fmt.Sprintf("llama-server started in %0.2f seconds", time.Since(s.loadStart).Seconds()))
+			slog.InfoContext(ctx, fmt.Sprintf("llama-server started in %0.2f seconds", time.Since(s.loadStart).Seconds()))
 			return nil
 		case ServerStatusError:
 			msg := s.lastErrMsg()
@@ -1665,7 +1838,7 @@ type llamaServerTokenProb struct {
 }
 
 func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse)) error {
-	slog.Debug("llama-server completion request", "media", len(req.Media), "prompt_len", len(req.Prompt))
+	slog.DebugContext(ctx, "llama-server completion request", "media", len(req.Media), "prompt_len", len(req.Prompt))
 
 	if req.Options == nil {
 		opts := api.DefaultOptions()
@@ -1674,7 +1847,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 
 	if err := s.sem.Acquire(ctx, 1); err != nil {
 		if errors.Is(err, context.Canceled) {
-			slog.Info("aborting completion request due to client closing the connection")
+			slog.InfoContext(ctx, "aborting completion request due to client closing the connection")
 		}
 		return err
 	}
@@ -1693,6 +1866,27 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	if err != nil {
 		return err
 	}
+
+	slog.InfoContext(ctx, "completion sampling parameters",
+		"prompt_chars", len(req.Prompt),
+		"media_count", len(req.Media),
+		"tools", req.ToolCallTag != "",
+		"temperature", req.Options.Temperature,
+		"top_k", req.Options.TopK,
+		"top_p", req.Options.TopP,
+		"min_p", req.Options.MinP,
+		"typical_p", req.Options.TypicalP,
+		"repeat_penalty", req.Options.RepeatPenalty,
+		"repeat_last_n", req.Options.RepeatLastN,
+		"presence_penalty", req.Options.PresencePenalty,
+		"frequency_penalty", req.Options.FrequencyPenalty,
+		"seed", req.Options.Seed,
+		"num_predict", req.Options.NumPredict,
+		"num_keep", req.Options.NumKeep,
+		"stop", req.Options.Stop,
+		"draft_num_predict", req.Options.DraftNumPredict,
+		"think", thinkValueForLog(req.Think),
+	)
 
 	// Build the llama-server request
 	lsReq := llamaServerCompletionRequest{
@@ -1787,7 +1981,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		if errors.Is(err, context.Canceled) {
 			return err
 		}
-		slog.Error("llama-server completion error", "error", err)
+		slog.ErrorContext(ctx, "llama-server completion error", "error", err)
 		if msg := s.lastErrMsg(); msg != "" {
 			return fmt.Errorf("model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details: %s", msg)
 		}
@@ -2036,7 +2230,7 @@ func (s *llamaServerRunner) ApplyChatTemplate(ctx context.Context, req ChatReque
 }
 
 func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(ChatResponse)) error {
-	slog.Debug("llama-server chat request", "messages", len(req.Messages), "tools", len(req.Tools))
+	slog.DebugContext(ctx, "llama-server chat request", "messages", len(req.Messages), "tools", len(req.Tools))
 
 	if req.Options == nil {
 		opts := api.DefaultOptions()
@@ -2045,13 +2239,33 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 
 	if err := s.sem.Acquire(ctx, 1); err != nil {
 		if errors.Is(err, context.Canceled) {
-			slog.Info("aborting chat request due to client closing the connection")
+			slog.InfoContext(ctx, "aborting chat request due to client closing the connection")
 		}
 		return err
 	}
 	defer s.sem.Release(1)
 
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
+
+	slog.InfoContext(ctx, "completion sampling parameters",
+		"messages", len(req.Messages),
+		"tools", len(req.Tools),
+		"temperature", req.Options.Temperature,
+		"top_k", req.Options.TopK,
+		"top_p", req.Options.TopP,
+		"min_p", req.Options.MinP,
+		"typical_p", req.Options.TypicalP,
+		"repeat_penalty", req.Options.RepeatPenalty,
+		"repeat_last_n", req.Options.RepeatLastN,
+		"presence_penalty", req.Options.PresencePenalty,
+		"frequency_penalty", req.Options.FrequencyPenalty,
+		"seed", req.Options.Seed,
+		"num_predict", req.Options.NumPredict,
+		"num_keep", req.Options.NumKeep,
+		"stop", req.Options.Stop,
+		"draft_num_predict", req.Options.DraftNumPredict,
+		"think", thinkValueForLog(req.Think),
+	)
 
 	status, err := s.getServerStatusRetry(ctx)
 	if err != nil {
@@ -2084,7 +2298,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		if errors.Is(err, context.Canceled) {
 			return err
 		}
-		slog.Error("llama-server chat error", "error", err)
+		slog.ErrorContext(ctx, "llama-server chat error", "error", err)
 		if msg := s.lastErrMsg(); msg != "" {
 			return fmt.Errorf("model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details: %s", msg)
 		}
@@ -2328,7 +2542,7 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 		body["logprobs"] = true
 		body["top_logprobs"] = max(req.TopLogprobs, 1)
 	}
-	if kwargs := llamaServerChatTemplateKwargs(req.Think); kwargs != nil {
+	if kwargs := llamaServerChatTemplateKwargs(chatRequestThink(req.Think, req.Options)); kwargs != nil {
 		body["chat_template_kwargs"] = kwargs
 	}
 	if format, err := llamaServerChatResponseFormat(req.Format); err != nil {
@@ -2338,6 +2552,26 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 	}
 
 	return body, nil
+}
+
+func thinkValueForLog(think *api.ThinkValue) any {
+	if think == nil {
+		return nil
+	}
+	return think.Value
+}
+
+// chatRequestThink returns the effective ThinkValue for a ChatRequest: the
+// top-level Think field takes priority, otherwise the Think option from
+// Options is used.
+func chatRequestThink(think *api.ThinkValue, opts *api.Options) *api.ThinkValue {
+	if think != nil {
+		return think
+	}
+	if opts != nil {
+		return opts.Think
+	}
+	return nil
 }
 
 func llamaServerChatTemplateKwargs(think *api.ThinkValue) map[string]any {

@@ -163,6 +163,25 @@ func LoadTimeout() (loadTimeout time.Duration) {
 	return loadTimeout
 }
 
+// StreamHeartbeat returns the interval for keepalive chunks during idle streaming periods. StreamHeartbeat can be configured via the OLLAMA_STREAM_HEARTBEAT environment variable.
+// Zero or negative disables heartbeats. Default is 0 (disabled).
+func StreamHeartbeat() time.Duration {
+	if s := Var("OLLAMA_STREAM_HEARTBEAT"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil {
+			if d > 0 {
+				return d
+			}
+			return 0
+		} else if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			if n > 0 {
+				return time.Duration(n) * time.Second
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
 func Remotes() []string {
 	var r []string
 	raw := strings.TrimSpace(Var("OLLAMA_REMOTES"))
@@ -196,6 +215,35 @@ func Bool(k string) func() bool {
 	}
 }
 
+func BoolPtr(k string) func() *bool {
+	return func() *bool {
+		if s := Var(k); s != "" {
+			b, err := strconv.ParseBool(s)
+			if err != nil {
+				return nil
+			}
+
+			return &b
+		}
+
+		return nil
+	}
+}
+
+func Int(key string, defaultValue int) func() int {
+	return func() int {
+		if s := Var(key); s != "" {
+			if n, err := strconv.ParseInt(s, 10, 64); err != nil {
+				slog.Warn("invalid environment variable, using default", "key", key, "value", s, "default", defaultValue)
+			} else {
+				return int(n)
+			}
+		}
+
+		return defaultValue
+	}
+}
+
 // LogLevel returns the log level for the application.
 // Values are 0 or false INFO (Default), 1 or true DEBUG, 2 TRACE
 func LogLevel() slog.Level {
@@ -218,18 +266,48 @@ var (
 	GoTemplate = BoolWithDefault("OLLAMA_GO_TEMPLATE")
 	// DebugLogRequests logs inference requests to disk for replay/debugging.
 	DebugLogRequests = Bool("OLLAMA_DEBUG_LOG_REQUESTS")
+	// Metrics enables the Prometheus-compatible /metrics endpoint.
+	Metrics = Bool("OLLAMA_METRICS")
+	// MetricsDisableAuth disables the auth label on per-user metrics.
+	MetricsDisableAuth = Bool("OLLAMA_METRICS_NO_AUTH")
+	// MetricsCloudUsage controls how cloud usage and balance metrics are
+	// collected: "on-demand" fetches after each cloud request, "interval"
+	// polls on a background timer, "none" disables fetching entirely.
+	// When unset, defaults to "none".
+	MetricsCloudUsage = String("OLLAMA_METRICS_CLOUD_USAGE")
+	// MetricsCloudUsageInterval is the background poll interval in seconds
+	// for cloud usage metrics when OLLAMA_METRICS_CLOUD_USAGE=interval.
+	MetricsCloudUsageInterval = Uint("OLLAMA_METRICS_USAGE_POLL", 30)
 	// KvCacheType is the quantization type for the K/V cache.
 	KvCacheType = String("OLLAMA_KV_CACHE_TYPE")
 	// NoHistory disables readline history.
 	NoHistory = Bool("OLLAMA_NOHISTORY")
 	// NoPrune disables pruning of model blobs on startup.
 	NoPrune = Bool("OLLAMA_NOPRUNE")
+	// Think controls the default value for thinking/reasoning on models that support it.
+	Think = BoolWithDefault("OLLAMA_THINK")
 	// SchedSpread allows scheduling models across all GPUs.
 	SchedSpread = Bool("OLLAMA_SCHED_SPREAD")
 	// ContextLength sets the default context length
-	ContextLength = Uint("OLLAMA_CONTEXT_LENGTH", 0)
+	ContextLength = Int("OLLAMA_CONTEXT_LENGTH", 0)
 	// Auth enables authentication between the Ollama client and server
 	UseAuth = Bool("OLLAMA_AUTH")
+	// UseMMap sets the default value for use_mmap
+	UseMMap = BoolPtr("OLLAMA_USE_MMAP")
+	// NumBatch sets the default batch size for prompt processing.
+	NumBatch = Int("OLLAMA_NUM_BATCH", 512)
+	// NumGPU sets the default number of GPU layers (-1 = dynamic).
+	NumGPU = Int("OLLAMA_NUM_GPU", -1)
+	// NumThread sets the default number of threads (0 = runtime default).
+	NumThread = Int("OLLAMA_NUM_THREAD", 0)
+	// DraftNumPredict sets the default number of tokens to predict in draft mode.
+	DraftNumPredict = Int("OLLAMA_DRAFT_NUM_PREDICT", 4)
+	// NumPredict sets the default number of tokens to predict (-1 = infinite).
+	NumPredict = Int("OLLAMA_NUM_PREDICT", -1)
+	// Shift sets the default value for context shifting when hitting the context length limit.
+	Shift = BoolWithDefault("OLLAMA_SHIFT")
+	// Truncate sets the default value for truncating chat history to fit the context window.
+	Truncate = BoolWithDefault("OLLAMA_TRUNCATE")
 	// EnableVulkan controls Vulkan backend discovery.
 	EnableVulkan = BoolWithDefault("OLLAMA_VULKAN")
 	// EnableIntegratedGPU controls whether integrated GPUs may be selected.
@@ -238,6 +316,12 @@ var (
 	NoCloudEnv = Bool("OLLAMA_NO_CLOUD")
 	// CreateRemote forces model creation through the server API even when the server is local.
 	CreateRemote = Bool("OLLAMA_CREATE_REMOTE")
+	// ApiKey sets a space-separated list of API keys or a path to a file with one per line.
+	ApiKey = String("OLLAMA_API_KEY")
+	// TrackRequests enables per-request UUID tracking in logs when true.
+	TrackRequests = Bool("OLLAMA_TRACK_REQUESTS")
+	// LogAuth enables logging the auth token in the gin request completion line.
+	LogAuth = Bool("OLLAMA_LOG_AUTH")
 )
 
 func String(s string) func() string {
@@ -274,7 +358,7 @@ func Uint(key string, defaultValue uint) func() uint {
 
 var (
 	// NumParallel sets the number of parallel model requests. NumParallel can be configured via the OLLAMA_NUM_PARALLEL environment variable.
-	NumParallel = Uint("OLLAMA_NUM_PARALLEL", 1)
+	NumParallel = Int("OLLAMA_NUM_PARALLEL", 1)
 	// MaxRunners sets the maximum number of loaded models. MaxRunners can be configured via the OLLAMA_MAX_LOADED_MODELS environment variable.
 	MaxRunners = Uint("OLLAMA_MAX_LOADED_MODELS", 0)
 	// MaxQueue sets the maximum number of queued requests. MaxQueue can be configured via the OLLAMA_MAX_QUEUE environment variable.
@@ -328,8 +412,15 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_MAX_LOADED_MODELS":    {"OLLAMA_MAX_LOADED_MODELS", MaxRunners(), "Maximum number of loaded models per GPU"},
 		"OLLAMA_MAX_TRANSFER_STREAMS": {"OLLAMA_MAX_TRANSFER_STREAMS", MaxTransferStreams(), "Maximum parallel transfer streams for safetensors model pulls/pushes (default 4)"},
 		"OLLAMA_MAX_QUEUE":            {"OLLAMA_MAX_QUEUE", MaxQueue(), "Maximum number of queued requests"},
+		"OLLAMA_METRICS":              {"OLLAMA_METRICS", Metrics(), "Enable the Prometheus-compatible /metrics endpoint"},
+		"OLLAMA_METRICS_NO_AUTH":      {"OLLAMA_METRICS_NO_AUTH", MetricsDisableAuth(), "Disable the auth label on per-user metrics (auth label is used by default)"},
+		"OLLAMA_METRICS_CLOUD_USAGE":  {"OLLAMA_METRICS_CLOUD_USAGE", MetricsCloudUsage(), "How to collect cloud usage and balance metrics: \"on-demand\" (fetch after each cloud request), \"interval\" (background poll), or \"none\" (disabled, default)"},
+		"OLLAMA_METRICS_USAGE_POLL":   {"OLLAMA_METRICS_USAGE_POLL", MetricsCloudUsageInterval(), "Background poll interval in seconds for cloud usage metrics (default 30)"},
 		"OLLAMA_MODELS":               {"OLLAMA_MODELS", Models(), "The path to the models directory"},
+		"OLLAMA_API_KEY":              {"OLLAMA_API_KEY", ApiKey(), "Space-separated list of API keys or path to a file containing API keys (one per line). When set, requests must include a matching Authorization header"},
 		"OLLAMA_NO_CLOUD":             {"OLLAMA_NO_CLOUD", NoCloud(), "Disable Ollama cloud features (remote inference and web search)"},
+		"OLLAMA_TRACK_REQUESTS":       {"OLLAMA_TRACK_REQUESTS", TrackRequests(), "Enable per-request UUID tracking in logs"},
+		"OLLAMA_LOG_AUTH":             {"OLLAMA_LOG_AUTH", LogAuth(), "Log auth token in gin request completion line"},
 		"OLLAMA_NOHISTORY":            {"OLLAMA_NOHISTORY", NoHistory(), "Do not preserve readline history"},
 		"OLLAMA_NOPRUNE":              {"OLLAMA_NOPRUNE", NoPrune(), "Do not prune model blobs on startup"},
 		"OLLAMA_NUM_PARALLEL":         {"OLLAMA_NUM_PARALLEL", NumParallel(), "Maximum number of parallel requests"},
@@ -337,8 +428,18 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_SCHED_SPREAD":         {"OLLAMA_SCHED_SPREAD", SchedSpread(), "Always schedule model across all GPUs"},
 		"OLLAMA_CONTEXT_LENGTH":       {"OLLAMA_CONTEXT_LENGTH", ContextLength(), "Context length to use unless otherwise specified (default: 4k/32k/256k based on VRAM)"},
 		"OLLAMA_CREATE_REMOTE":        {"OLLAMA_CREATE_REMOTE", CreateRemote(), "Force model creation through the server API even when the server is local"},
+		"OLLAMA_THINK":                {"OLLAMA_THINK", Think(true), "Enable thinking/reasoning by default on models that support it (default true)"},
 		"OLLAMA_EDITOR":               {"OLLAMA_EDITOR", Editor(), "Path to editor for interactive prompt editing (Ctrl+G)"},
 		"OLLAMA_REMOTES":              {"OLLAMA_REMOTES", Remotes(), "Allowed hosts for remote models (default \"ollama.com\")"},
+		"OLLAMA_USE_MMAP":             {"OLLAMA_USE_MMAP", UseMMap(), "Set default value for use_mmap"},
+		"OLLAMA_NUM_BATCH":            {"OLLAMA_NUM_BATCH", NumBatch(), "Batch size for prompt processing (default 512)"},
+		"OLLAMA_NUM_GPU":              {"OLLAMA_NUM_GPU", NumGPU(), "Number of GPU layers (-1 = dynamic)"},
+		"OLLAMA_NUM_THREAD":           {"OLLAMA_NUM_THREAD", NumThread(), "Number of threads (0 = runtime default)"},
+		"OLLAMA_DRAFT_NUM_PREDICT":    {"OLLAMA_DRAFT_NUM_PREDICT", DraftNumPredict(), "Number of tokens to predict in draft mode (default 4)"},
+		"OLLAMA_NUM_PREDICT":          {"OLLAMA_NUM_PREDICT", NumPredict(), "Number of tokens to predict (-1 = infinite)"},
+		"OLLAMA_SHIFT":                {"OLLAMA_SHIFT", Shift(true), "Shift context when hitting the context length limit instead of erroring (default true)"},
+		"OLLAMA_TRUNCATE":             {"OLLAMA_TRUNCATE", Truncate(true), "Truncate chat history to fit the context window (default true)"},
+		"OLLAMA_STREAM_HEARTBEAT":     {"OLLAMA_STREAM_HEARTBEAT", StreamHeartbeat(), "Interval for keepalive chunks during idle streaming periods (default disabled)"},
 
 		// Informational
 		"HTTP_PROXY":  {"HTTP_PROXY", String("HTTP_PROXY")(), "HTTP proxy"},
@@ -369,7 +470,15 @@ func AsMap() map[string]EnvVar {
 func Values() map[string]string {
 	vals := make(map[string]string)
 	for k, v := range AsMap() {
-		vals[k] = fmt.Sprintf("%v", v.Value)
+		value := v.Value
+		if p, ok := value.(*bool); ok {
+			if p == nil {
+				value = ""
+			} else {
+				value = *p
+			}
+		}
+		vals[k] = fmt.Sprintf("%v", value)
 	}
 	return vals
 }

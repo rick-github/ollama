@@ -88,6 +88,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 
 	config.Renderer = r.Renderer
 	config.Parser = r.Parser
+	config.Jinja = r.Jinja
 	config.Requires = r.Requires
 	for _, capability := range r.Capabilities {
 		if !model.Capability(capability).IsValid() {
@@ -252,6 +253,9 @@ func (s *Server) CreateHandler(c *gin.Context) {
 				}
 				if requestConfig.Parser != "" {
 					config.Parser = requestConfig.Parser
+				}
+				if requestConfig.Jinja != "" {
+					config.Jinja = requestConfig.Jinja
 				}
 				if requestConfig.Requires != "" {
 					config.Requires = requestConfig.Requires

@@ -115,6 +115,7 @@ func TestBoundedNumPredict(t *testing.T) {
 		want       int
 	}{
 		{name: "open ended gets finite budget", numPredict: -1, numCtx: 2048, want: 20480},
+		{name: "fill context bounded to one context window", numPredict: -2, numCtx: 2048, want: 2048},
 		{name: "explicit under limit preserved", numPredict: 100, numCtx: 2048, want: 100},
 		{name: "explicit over limit capped", numPredict: 30000, numCtx: 2048, want: 20480},
 		{name: "unknown context unchanged", numPredict: -1, numCtx: 0, want: -1},
@@ -2111,6 +2112,81 @@ func TestAppendFlashAttentionArgs(t *testing.T) {
 	}
 }
 
+func TestAppendFlashAttentionArgsFor(t *testing.T) {
+	supportedGPU := []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "CUDA"}, DriverMajor: 13, ComputeMajor: 8, ComputeMinor: 9}}
+	oldGPU := []ml.DeviceInfo{
+		{DeviceID: ml.DeviceID{Library: "CUDA"}, DriverMajor: 12, ComputeMajor: 8, ComputeMinor: 9},
+		{DeviceID: ml.DeviceID{Library: "CUDA"}, DriverMajor: 12, ComputeMajor: 5, ComputeMinor: 0},
+	}
+
+	tr, fa := true, false
+	ptr := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name string
+		opts api.Options
+		env  string
+		set  bool
+		gpus []ml.DeviceInfo
+		want []string
+	}{
+		{
+			name: "nil opts falls back to env auto on supported gpu",
+			opts: api.Options{},
+			gpus: supportedGPU,
+			want: []string{"base", "--flash-attn", "auto"},
+		},
+		{
+			name: "per-model true forces on regardless of env",
+			opts: api.Options{Runner: api.Runner{FlashAttention: &tr}},
+			env:  "0",
+			set:  true,
+			gpus: supportedGPU,
+			want: []string{"base", "--flash-attn", "on"},
+		},
+		{
+			name: "per-model false forces off regardless of env",
+			opts: api.Options{Runner: api.Runner{FlashAttention: &fa}},
+			env:  "1",
+			set:  true,
+			gpus: supportedGPU,
+			want: []string{"base", "--flash-attn", "off"},
+		},
+		{
+			name: "per-model true overrides old-cuda auto-off default",
+			opts: api.Options{Runner: api.Runner{FlashAttention: ptr(true)}},
+			gpus: oldGPU,
+			want: []string{"base", "--flash-attn", "on"},
+		},
+		{
+			name: "per-model false overrides env-on",
+			opts: api.Options{Runner: api.Runner{FlashAttention: ptr(false)}},
+			env:  "1",
+			set:  true,
+			gpus: supportedGPU,
+			want: []string{"base", "--flash-attn", "off"},
+		},
+		{
+			name: "nil opts respects env off",
+			opts: api.Options{},
+			env:  "0",
+			set:  true,
+			gpus: supportedGPU,
+			want: []string{"base", "--flash-attn", "off"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setFlashAttentionEnv(t, tt.env, tt.set)
+			got := appendFlashAttentionArgsFor([]string{"base"}, tt.opts, tt.gpus)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("appendFlashAttentionArgsFor = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAppendMainGPUArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2601,6 +2677,59 @@ func TestAppendContextShiftArgs(t *testing.T) {
 			got := appendContextShiftArgs([]string{"base"}, tt.opts, tt.enabled)
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("appendContextShiftArgs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAppendArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		opts api.Options
+		want []string
+	}{
+		{
+			name: "no args leaves params unchanged",
+			opts: api.Options{},
+			want: []string{"base"},
+		},
+		{
+			name: "space-separated args appended verbatim",
+			opts: api.Options{Runner: api.Runner{Args: []string{"--image-max-tokens", "4096"}}},
+			want: []string{"base", "--image-max-tokens", "4096"},
+		},
+		{
+			name: "flag-only arg",
+			opts: api.Options{Runner: api.Runner{Args: []string{"--no-mmproj-offload"}}},
+			want: []string{"base", "--no-mmproj-offload"},
+		},
+		{
+			name: "equals-form flag split into two tokens",
+			opts: api.Options{Runner: api.Runner{Args: []string{"--image-max-tokens=4096"}}},
+			want: []string{"base", "--image-max-tokens", "4096"},
+		},
+		{
+			name: "mixed equals and space-separated forms",
+			opts: api.Options{Runner: api.Runner{Args: []string{"--image-min-tokens=1024", "--image-max-tokens", "4096"}}},
+			want: []string{"base", "--image-min-tokens", "1024", "--image-max-tokens", "4096"},
+		},
+		{
+			name: "equals split on first = only",
+			opts: api.Options{Runner: api.Runner{Args: []string{"--key=a=b"}}},
+			want: []string{"base", "--key", "a=b"},
+		},
+		{
+			name: "non-flag value with = is not split",
+			opts: api.Options{Runner: api.Runner{Args: []string{"--tensor-buffer-overrides", "blk.0=CUDA0"}}},
+			want: []string{"base", "--tensor-buffer-overrides", "blk.0=CUDA0"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := appendArgs([]string{"base"}, tt.opts)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("appendArgs = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -4066,5 +4195,29 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
 	}
 	if got := conversions.Load(); got != 1 {
 		t.Errorf("json format converted a schema, %d conversions", got)
+	}
+}
+
+func TestSplitKvCacheType(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    string
+		wantK string
+		wantV string
+	}{
+		{"single value applied to both", "q8_0", "q8_0", "q8_0"},
+		{"comma-separated K,V", "q8_0,f16", "q8_0", "f16"},
+		{"whitespace trimmed and lowercased", " Q8_0 , F16 ", "q8_0", "f16"},
+		{"trailing comma sets K only", "q8_0,", "q8_0", ""},
+		{"leading comma sets V only", ",f16", "", "f16"},
+		{"empty string", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotK, gotV := splitKvCacheType(tt.in)
+			if gotK != tt.wantK || gotV != tt.wantV {
+				t.Errorf("splitKvCacheType(%q) = (%q, %q), want (%q, %q)", tt.in, gotK, gotV, tt.wantK, tt.wantV)
+			}
+		})
 	}
 }

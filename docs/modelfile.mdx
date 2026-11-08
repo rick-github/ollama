@@ -17,6 +17,7 @@ A Modelfile is the blueprint to create and share customized models using Ollama.
     - [Valid Parameters and Values](#valid-parameters-and-values)
   - [TEMPLATE](#template)
     - [Template Variables](#template-variables)
+  - [JINJA](#jinja)
   - [SYSTEM](#system)
   - [LICENSE](#license)
   - [MESSAGE](#message)
@@ -37,6 +38,7 @@ INSTRUCTION arguments
 | [`FROM`](#from-required) (required) | Defines the base model to use.                                 |
 | [`PARAMETER`](#parameter)           | Sets the parameters for how Ollama will run the model.         |
 | [`TEMPLATE`](#template)             | The full prompt template to be sent to the model.              |
+| [`JINJA`](#jinja)                   | A custom Jinja2 chat template to be sent to the model.         |
 | [`SYSTEM`](#system)                 | Specifies the system message that will be set in the template. |
 | [`LICENSE`](#license)               | Specifies the legal license.                                   |
 | [`MESSAGE`](#message)               | Specify message history.                                       |
@@ -151,11 +153,18 @@ PARAMETER <parameter> <parametervalue>
 | temperature    | The temperature of the model. Increasing the temperature will make the model answer more creatively. (Default: 0.8)                                                                                                                                                                                                                                                             | float      | temperature 0.7      |
 | seed           | Sets the random number seed to use for generation. Setting this to a specific number will make the model generate the same text for the same prompt. (Default: 0)                                                                                                                                                                                                               | int        | seed 42              |
 | stop           | Sets the stop sequences to use. When this pattern is encountered the LLM will stop generating text and return. Multiple stop patterns may be set by specifying multiple separate `stop` parameters in a modelfile.                                                                                                                                                              | string     | stop "AI assistant:" |
-| num_predict    | Maximum number of tokens to predict when generating text. (Default: -1, infinite generation)                                                                                                                                                                                                                                                                                    | int        | num_predict 42       |
+| num_predict    | Maximum number of tokens to predict when generating text. (Default: -1, infinite generation, -2 = fill context)                                                                                                                                                                                                                                                                | int        | num_predict 42       |
+| num_parallel   | Sets the number of parallel requests to the model. (Default: 1)                                                                                                                                                                                                                                                                                                                  | int        | num_parallel 4       |
 | draft_num_predict | Maximum number of speculative draft tokens to predict per step when a draft model is available. Separate draft models default to 4; embedded MTP tensors require setting this parameter. Set to 0 to disable speculative drafting.                                                                                                                                               | int        | draft_num_predict 4  |
 | top_k          | Reduces the probability of generating nonsense. A higher value (e.g. 100) will give more diverse answers, while a lower value (e.g. 10) will be more conservative. (Default: 40)                                                                                                                                                                                                | int        | top_k 40             |
 | top_p          | Works together with top-k. A higher value (e.g., 0.95) will lead to more diverse text, while a lower value (e.g., 0.5) will generate more focused and conservative text. (Default: 0.9)                                                                                                                                                                                         | float      | top_p 0.9            |
 | min_p          | Alternative to the top*p, and aims to ensure a balance of quality and variety. The parameter \_p* represents the minimum probability for a token to be considered, relative to the probability of the most likely token. For example, with _p_=0.05 and the most likely token having a probability of 0.9, logits with a value less than 0.045 are filtered out. (Default: 0.0) | float      | min_p 0.05           |
+| env            | Sets environment variables for the model runner process. Each entry is `KEY=VALUE`. Multiple entries may be specified by repeating the `env` parameter. (Default: none)                                                                                                                                                                                                                                                              | list       | env "LLAMA_KV_CACHE_TYPE=q8_0" |
+| flash_attention | Enables or disables flash attention for this model, overriding the `OLLAMA_FLASH_ATTENTION` environment variable. When unset, Ollama follows the global env var and falls back to automatic detection based on backend/device support. (Default: unset) | bool       | flash_attention true |
+| kv_cache_type  | Sets the quantization type for the K/V cache for this model, overriding the `OLLAMA_KV_CACHE_TYPE` environment variable. Supported values: `f32`, `f16` (default), `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`. A single value applies to both K and V; a comma-separated pair `k,v` (e.g. `q8_0,f16`) sets the K and V cache types independently. When unset, the global env var applies. (Default: unset) | string     | kv_cache_type q8_0   |
+| args          | Extra command-line arguments appended verbatim to the runner when the model is loaded. `--flag=value` is split into `--flag value`. Changing triggers a model reload. (Default: none) | string | args --image-max-tokens=4096 |
+| think          | Controls whether thinking/reasoning models will think before responding. Can be `true`, `false`, or a model-defined thinking level string (e.g. `"high"`, `"medium"`, `"low"`). When set, the request-level `think` field (or `reasoning_effort` in the OpenAI-compatible endpoint) overrides this value. (Default: unset — use `OLLAMA_THINK` env var, default true)           | string     | think high            |
+| think_level    | Valid think string values for models without thinking metadata. May be specified multiple times to add several levels. When set, overrides the default list (`high`, `medium`, `low`, `max`). Use with `CAPABILITY thinking` to enable thinking on models that lack thinking metadata. The `true` and `false` strings are rendered as boolean think values. (Default: none — use hardcoded list) | string | think_level high |
 
 ### TEMPLATE
 
@@ -176,6 +185,19 @@ TEMPLATE """{{ if .System }}<|im_start|>system
 {{ .Prompt }}<|im_end|>
 {{ end }}<|im_start|>assistant
 """
+```
+
+### JINJA
+
+The `JINJA` instruction specifies a custom Jinja2 chat template that is passed directly to the model runner. When specified, it takes precedence over `TEMPLATE`, `RENDERER`/`PARSER`, and the GGUF-embedded chat template. The template uses [Jinja2 syntax](https://jinja.palletsprojects.com/en/stable/templates/).
+
+```
+JINJA """{%- for message in messages -%}
+{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- endif -%}"""
 ```
 
 ### SYSTEM
@@ -240,6 +262,35 @@ REQUIRES <version>
 ```
 
 The version should be a valid Ollama version (e.g. 0.14.0).
+
+## Quoting
+
+String values in a `Modelfile` can use several quoting mechanisms:
+
+- **No quotes**: The sequence of characters to the end of the line is the string value.
+- **Single double-quote (`"`)**: A `"` at the start of the value is matched by a `"` at the end of the line. The content between them is the string.
+- **Triple double-quotes (`"""`)**: For multi-line strings. A `"""` at the start is matched by a `"""` on a subsequent line. The content between them (including newlines) is the string.
+- **Single single-quote (`'`)**: Like a single `"`, but using `'` as the delimiter. Useful when the value contains `"` characters.
+- **Triple single-quotes (`'''`)**: Like `"""`, but using `'` as the delimiter. Useful when the value contains `"` characters.
+
+### Extended quoting for embedded quote sequences
+
+If a string value contains a run of `n` consecutive quote characters (e.g. `"""`), the standard triple-quote delimiter would terminate the string prematurely. To handle this, use `n+1` quote characters as the delimiter:
+
+```
+# Content contains """ (three double-quotes), so use """" (four) as delimiters
+SYSTEM """"This string has """ inside it.""""
+```
+
+The same applies to single-quote delimiters:
+
+```
+SYSTEM ''''This string has ''' inside it.''''
+```
+
+The opening delimiter is the longest consecutive run of the same quote character at the start of the value. The closing delimiter must be the same character repeated the same number of times. This lets the content contain up to `n-1` consecutive quote characters when `n`-quote delimiters are used.
+
+When `ollama show` prints a Modelfile, it automatically selects the minimum number of quote characters needed to avoid ambiguity, preferring double-quotes for backward compatibility.
 
 ## Notes
 

@@ -75,16 +75,20 @@ func (l *inferenceRequestLogger) middleware(route string) gin.HandlerFunc {
 			body, err = io.ReadAll(c.Request.Body)
 			c.Request.Body = io.NopCloser(bytes.NewReader(body))
 			if err != nil {
-				slog.Warn("failed to read request body for debug logging", "route", route, "error", err)
+				slog.WarnContext(c.Request.Context(), "failed to read request body for debug logging", "route", route, "error", err)
 			}
 		}
 
 		c.Next()
-		l.log(route, method, scheme, host, contentType, body)
+		var reqID string
+		if v, ok := c.Get("request_id"); ok {
+			reqID, _ = v.(string)
+		}
+		l.log(route, method, scheme, host, contentType, body, reqID)
 	}
 }
 
-func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType string, body []byte) {
+func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType string, body []byte, reqID string) {
 	if l == nil || l.dir == "" {
 		return
 	}
@@ -103,9 +107,13 @@ func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType st
 	}
 
 	routeForFilename := sanitizeRouteForFilename(route)
+	idSuffix := ""
+	if reqID != "" {
+		idSuffix = "_" + reqID[:min(len(reqID), 8)]
+	}
 	timestamp := fmt.Sprintf("%s-%06d", time.Now().UTC().Format("20060102T150405.000000000Z"), atomic.AddUint64(&l.counter, 1))
-	bodyFilename := fmt.Sprintf("%s_%s_body.json", timestamp, routeForFilename)
-	curlFilename := fmt.Sprintf("%s_%s_request.sh", timestamp, routeForFilename)
+	bodyFilename := fmt.Sprintf("%s_%s%s_body.json", timestamp, idSuffix, routeForFilename)
+	curlFilename := fmt.Sprintf("%s_%s%s_request.sh", timestamp, idSuffix, routeForFilename)
 	bodyPath := filepath.Join(l.dir, bodyFilename)
 	curlPath := filepath.Join(l.dir, curlFilename)
 
@@ -121,7 +129,7 @@ func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType st
 		return
 	}
 
-	slog.Info(fmt.Sprintf("logged to %s, replay using curl with `sh %s`", bodyPath, curlPath))
+	slog.Info(fmt.Sprintf("logged to %s, replay using curl with `sh %s`", bodyPath, curlPath), "req_id", reqID)
 }
 
 func sanitizeRouteForFilename(route string) string {

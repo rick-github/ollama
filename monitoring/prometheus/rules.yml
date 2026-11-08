@@ -1,0 +1,114 @@
+groups:
+  - name: ollama-rules
+    rules:
+      # --- Rates over common time windows ---
+      - record: ollama:request_rate_1m
+        expr: rate(ollama_requests_completed_total[1m])
+      - record: ollama:request_rate_5m
+        expr: rate(ollama_requests_completed_total[5m])
+      - record: ollama:request_rate_1h
+        expr: rate(ollama_requests_completed_total[1h])
+
+      - record: ollama:error_rate_1m
+        expr: rate(ollama_request_errors_total[1m])
+      - record: ollama:error_rate_5m
+        expr: rate(ollama_request_errors_total[5m])
+      - record: ollama:error_rate_1h
+        expr: rate(ollama_request_errors_total[1h])
+
+      # --- Counts over time windows ---
+      - record: ollama:requests_1m
+        expr: increase(ollama_requests_completed_total[1m])
+      - record: ollama:requests_5m
+        expr: increase(ollama_requests_completed_total[5m])
+      - record: ollama:requests_1h
+        expr: increase(ollama_requests_completed_total[1h])
+      - record: ollama:requests_1d
+        expr: increase(ollama_requests_completed_total[1d])
+
+      - record: ollama:errors_1m
+        expr: increase(ollama_request_errors_total[1m])
+      - record: ollama:errors_5m
+        expr: increase(ollama_request_errors_total[5m])
+      - record: ollama:errors_1h
+        expr: increase(ollama_request_errors_total[1h])
+
+      # --- Token throughput ---
+      - record: ollama:tokens_generated_rate_1m
+        expr: rate(ollama_eval_total[1m])
+      - record: ollama:tokens_generated_rate_5m
+        expr: rate(ollama_eval_total[5m])
+      - record: ollama:tokens_prompt_rate_1m
+        expr: rate(ollama_prompt_eval_total[1m]) - rate(ollama_prompt_eval_cached_total[1m])
+      - record: ollama:tokens_prompt_rate_5m
+        expr: rate(ollama_prompt_eval_total[5m]) - rate(ollama_prompt_eval_cached_total[5m])
+      - record: ollama:tokens_prompt_total_rate_1m
+        expr: rate(ollama_prompt_eval_total[1m])
+      - record: ollama:tokens_prompt_total_rate_5m
+        expr: rate(ollama_prompt_eval_total[5m])
+      - record: ollama:tokens_prompt_cached_rate_1m
+        expr: rate(ollama_prompt_eval_cached_total[1m])
+      - record: ollama:tokens_prompt_cached_rate_5m
+        expr: rate(ollama_prompt_eval_cached_total[5m])
+      - record: ollama:prompt_cache_hit_ratio_5m
+        expr: >
+          sum(rate(ollama_prompt_eval_cached_total[5m]))
+          /
+          clamp_min(sum(rate(ollama_prompt_eval_total[5m])), 1)
+
+      # --- Error ratio ---
+      - record: ollama:error_ratio_5m
+        expr: >
+          sum(rate(ollama_request_errors_total[5m]))
+          /
+          clamp_min(sum(rate(http_requests_total[5m])), 1)
+
+      # --- Per-user rates (aggregate across models) ---
+      - record: ollama:user_request_rate_5m
+        expr: sum by (auth) (rate(ollama_requests_completed_total[5m]))
+      - record: ollama:user_token_rate_5m
+        expr: sum by (auth) (rate(ollama_eval_total[5m]))
+
+      # --- Per-model rates (aggregate across auth and action) ---
+      - record: ollama:model_request_rate_1m
+        expr: sum by (model) (rate(ollama_requests_completed_total[5m]))
+      - record: ollama:model_request_rate_5m
+        expr: sum by (model) (rate(ollama_requests_completed_total[5m]))
+      - record: ollama:model_request_rate_1h
+        expr: sum by (model) (rate(ollama_requests_completed_total[1h]))
+      - record: ollama:model_requests_1d
+        expr: sum by (model) (increase(ollama_requests_completed_total[1d]))
+
+      # --- Local vs cloud ---
+      - record: ollama:cloud_request_rate_5m
+        expr: sum by (model) (rate(ollama_cloud_requests_total[5m]))
+      - record: ollama:cloud_requests_1h
+        expr: sum by (model) (increase(ollama_cloud_requests_total[1h]))
+      - record: ollama:local_request_rate_5m
+        expr: >
+          sum by (model) (rate(ollama_requests_completed_total[5m]))
+          - on(model) group_left()
+          sum by (model) (rate(ollama_cloud_requests_total[5m]))
+      - record: ollama:local_requests_1h
+        expr: >
+          sum by (model) (increase(ollama_requests_completed_total[1h]))
+          - on(model) group_left()
+          sum by (model) (increase(ollama_cloud_requests_total[1h]))
+
+      # --- Time to first token / first byte ---
+      - record: ollama:ttft_p50_5m
+        expr: histogram_quantile(0.50, sum by (le, model) (rate(ollama_time_to_first_token_seconds_bucket[5m])))
+      - record: ollama:ttft_p95_5m
+        expr: histogram_quantile(0.95, sum by (le, model) (rate(ollama_time_to_first_token_seconds_bucket[5m])))
+      - record: ollama:ttft_p99_5m
+        expr: histogram_quantile(0.99, sum by (le, model) (rate(ollama_time_to_first_token_seconds_bucket[5m])))
+
+      # --- Queue depth by model ---
+      - alert: OllamaQueueDepthByModelHigh
+        expr: ollama_requests_queued_by_model > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue depth high for {{ $labels.model }}"
+          description: "Model {{ $labels.model }} has {{ $value }} queued requests."

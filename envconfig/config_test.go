@@ -293,6 +293,28 @@ func TestLoadTimeout(t *testing.T) {
 	}
 }
 
+func TestStreamHeartbeat(t *testing.T) {
+	cases := map[string]time.Duration{
+		"":        0,
+		"0":       0,
+		"10s":     10 * time.Second,
+		"1m":      time.Minute,
+		"30":      30 * time.Second,
+		"-1":      0,
+		"-1s":     0,
+		"invalid": 0,
+	}
+
+	for tt, expect := range cases {
+		t.Run(tt, func(t *testing.T) {
+			t.Setenv("OLLAMA_STREAM_HEARTBEAT", tt)
+			if actual := StreamHeartbeat(); actual != expect {
+				t.Errorf("%s: expected %s, got %s", tt, expect, actual)
+			}
+		})
+	}
+}
+
 func TestVar(t *testing.T) {
 	cases := map[string]string{
 		"value":       "value",
@@ -314,7 +336,7 @@ func TestVar(t *testing.T) {
 }
 
 func TestContextLength(t *testing.T) {
-	cases := map[string]uint{
+	cases := map[string]int{
 		"":     0,
 		"2048": 2048,
 	}

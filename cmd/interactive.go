@@ -617,6 +617,13 @@ func NewCreateRequest(name string, opts runOptions) *api.CreateRequest {
 		req.Parameters = opts.Options
 	}
 
+	if opts.Think != nil {
+		if req.Parameters == nil {
+			req.Parameters = map[string]any{}
+		}
+		req.Parameters["think"] = opts.Think.Value
+	}
+
 	messages := slices.Clone(opts.LoadedMessages)
 	messages = append(messages, opts.Messages...)
 	if len(messages) > 0 {

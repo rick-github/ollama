@@ -167,7 +167,7 @@ func TestCloudPassthroughMiddleware_ZstdBody(t *testing.T) {
 	nextCalled := false
 
 	r := gin.New()
-	r.POST("/v1/responses", cloudPassthroughMiddleware("test"), func(c *gin.Context) {
+	r.POST("/v1/responses", (&Server{}).cloudPassthroughMiddleware("test"), func(c *gin.Context) {
 		nextCalled = true
 		// Verify the body is decompressed and Content-Encoding is removed.
 		body, err := io.ReadAll(c.Request.Body)
@@ -224,7 +224,7 @@ func TestCloudPassthroughMiddleware_ZstdBodyTooLarge(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	r := gin.New()
-	r.POST("/v1/responses", cloudPassthroughMiddleware("test"), func(c *gin.Context) {
+	r.POST("/v1/responses", (&Server{}).cloudPassthroughMiddleware("test"), func(c *gin.Context) {
 		t.Fatal("handler should not be reached for oversized body")
 	})
 	r.ServeHTTP(rec, req)

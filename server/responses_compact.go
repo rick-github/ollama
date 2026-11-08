@@ -171,7 +171,7 @@ func isCompactionContextLimit(response *responsesInferenceRecorder) bool {
 func (s *Server) runResponsesCompactionInference(c *gin.Context, body []byte) *responsesInferenceRecorder {
 	router := gin.New()
 	router.POST("/v1/responses",
-		cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
+		s.cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable),
 		middleware.ResponsesMiddleware(),
 		s.ChatHandler,
 	)

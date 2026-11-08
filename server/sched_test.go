@@ -210,7 +210,7 @@ func TestSchedVisionContextFloor(t *testing.T) {
 		opts := api.DefaultOptions()
 		opts.NumCtx = 128
 
-		s.getRunner(ctx, visionModel, opts, nil, true, false, nil)
+		s.getRunner(ctx, visionModel, opts, nil, true, false, nil, "anon")
 
 		req := <-s.pendingReqCh
 		require.Equal(t, 2048, req.opts.NumCtx)
@@ -222,7 +222,7 @@ func TestSchedVisionContextFloor(t *testing.T) {
 		opts := api.DefaultOptions()
 		opts.NumCtx = 128
 
-		s.getRunner(ctx, visionModel, opts, nil, false, false, nil)
+		s.getRunner(ctx, visionModel, opts, nil, false, false, nil, "anon")
 
 		req := <-s.pendingReqCh
 		require.Equal(t, 2048, req.opts.NumCtx)
@@ -552,10 +552,10 @@ func TestSchedGetRunner(t *testing.T) {
 	s.getSystemInfoFn = getSystemInfoFn
 	s.newServerFn = a.newServer
 	slog.Info("a")
-	successCh1a, errCh1a := s.getRunner(a.ctx, a.req.model, a.req.opts, a.req.sessionDuration, false, false, nil)
+	successCh1a, errCh1a := s.getRunner(a.ctx, a.req.model, a.req.opts, a.req.sessionDuration, false, false, nil, "anon")
 	require.Len(t, s.pendingReqCh, 1)
 	slog.Info("b")
-	successCh1b, errCh1b := s.getRunner(b.ctx, b.req.model, b.req.opts, b.req.sessionDuration, false, false, nil)
+	successCh1b, errCh1b := s.getRunner(b.ctx, b.req.model, b.req.opts, b.req.sessionDuration, false, false, nil, "anon")
 	require.Len(t, s.pendingReqCh, 1)
 	require.Empty(t, successCh1b)
 	require.Len(t, errCh1b, 1)
@@ -579,7 +579,7 @@ func TestSchedGetRunner(t *testing.T) {
 
 	c.req.model.ModelPath = "bad path"
 	slog.Info("c")
-	successCh1c, errCh1c := s.getRunner(c.ctx, c.req.model, c.req.opts, c.req.sessionDuration, false, false, nil)
+	successCh1c, errCh1c := s.getRunner(c.ctx, c.req.model, c.req.opts, c.req.sessionDuration, false, false, nil, "anon")
 	// Starts in pending channel, then should be quickly processed to return an error
 	time.Sleep(50 * time.Millisecond) // Long enough for the "a" model to expire and unload
 	require.Empty(t, successCh1c)
@@ -614,7 +614,7 @@ func TestSchedGetRunnerUsesDigestKeyWhenModelPathEmpty(t *testing.T) {
 	s.loadedMu.Unlock()
 
 	reqModel := &Model{Name: "safetensors-b", Digest: "sha-b"}
-	successCh, errCh := s.getRunner(ctx, reqModel, opts, nil, false, false, nil)
+	successCh, errCh := s.getRunner(ctx, reqModel, opts, nil, false, false, nil, "anon")
 
 	require.Empty(t, successCh)
 	require.Empty(t, errCh)
@@ -651,7 +651,7 @@ func TestSchedGetRunnerUsesManifestDigestKeyWhenModelPathEmpty(t *testing.T) {
 	s.loadedMu.Unlock()
 
 	reqModel := &Model{Name: "list", Digest: "parent", ManifestDigest: "child-b"}
-	successCh, errCh := s.getRunner(ctx, reqModel, opts, nil, false, false, nil)
+	successCh, errCh := s.getRunner(ctx, reqModel, opts, nil, false, false, nil, "anon")
 
 	require.Empty(t, successCh)
 	require.Empty(t, errCh)
@@ -680,7 +680,7 @@ func TestSchedGetRunnerReusesSameDigestWhenModelPathEmpty(t *testing.T) {
 	s.loadedMu.Unlock()
 
 	reqCtx, cancelReq := context.WithCancel(ctx)
-	successCh, errCh := s.getRunner(reqCtx, &Model{Name: "safetensors-a-copy", Digest: "sha-a"}, opts, nil, false, false, nil)
+	successCh, errCh := s.getRunner(reqCtx, &Model{Name: "safetensors-a-copy", Digest: "sha-a"}, opts, nil, false, false, nil, "anon")
 	cancelReq()
 
 	select {
@@ -790,7 +790,7 @@ func TestSchedPrematureExpired(t *testing.T) {
 	s.getGpuFn = getGpuFn
 	s.getSystemInfoFn = getSystemInfoFn
 	s.newServerFn = scenario1a.newServer
-	successCh1a, errCh1a := s.getRunner(scenario1a.ctx, scenario1a.req.model, scenario1a.req.opts, scenario1a.req.sessionDuration, false, false, nil)
+	successCh1a, errCh1a := s.getRunner(scenario1a.ctx, scenario1a.req.model, scenario1a.req.opts, scenario1a.req.sessionDuration, false, false, nil, "anon")
 	require.Len(t, s.pendingReqCh, 1)
 	s.Run(ctx)
 	select {
@@ -838,6 +838,36 @@ func TestSchedUseLoadedRunner(t *testing.T) {
 	req.useLoadedRunner(r1, finished)
 	require.Equal(t, uint(1), r1.refCount)
 	require.Equal(t, time.Duration(2), r1.sessionDuration)
+	select {
+	case success := <-req.successCh:
+		require.Equal(t, r1, success)
+	case err := <-req.errCh:
+		t.Fatal(err.Error())
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	done()
+	fin := <-finished
+	require.Equal(t, req, fin)
+}
+
+func TestSchedUseLoadedRunnerExpiring(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	req := &LlmRequest{
+		ctx:             ctx,
+		opts:            api.DefaultOptions(),
+		successCh:       make(chan *runnerRef, 1),
+		sessionDuration: &api.Duration{Duration: 5 * time.Minute},
+	}
+	finished := make(chan *LlmRequest)
+	llm1 := &mockLlm{vramByGPU: map[ml.DeviceID]uint64{}}
+	r1 := &runnerRef{llama: llm1, sessionDuration: 0, expiring: true, numParallel: 1}
+	req.useLoadedRunner(r1, finished)
+	// Request can still use the loaded runner
+	require.Equal(t, uint(1), r1.refCount)
+	// But sessionDuration must NOT be overwritten — runner still expires immediately
+	require.Equal(t, time.Duration(0), r1.sessionDuration)
+	require.True(t, r1.expiring)
 	select {
 	case success := <-req.successCh:
 		require.Equal(t, r1, success)
@@ -1137,6 +1167,67 @@ func TestSchedNeedsReloadIgnoresAutomaticUseMMapDefault(t *testing.T) {
 
 	runner.useMMapAuto = false
 	req.opts.UseMMap = nil
+	require.True(t, runner.needsReload(ctx, req))
+}
+
+func TestSchedNeedsReloadKvCacheType(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer done()
+
+	ml := &mockLlm{vramByGPU: map[ml.DeviceID]uint64{}}
+	opts := api.DefaultOptions()
+	opts.KvCacheType = "q8_0"
+	model := &Model{}
+	runner := &runnerRef{
+		Options:     &opts,
+		llama:       ml,
+		numParallel: 1,
+	}
+	runner.model.Store(model)
+
+	// Same kv_cache_type -> no reload
+	req := &LlmRequest{model: model, opts: api.DefaultOptions()}
+	req.opts.KvCacheType = "q8_0"
+	require.False(t, runner.needsReload(ctx, req))
+
+	// Different kv_cache_type -> reload
+	req.opts.KvCacheType = "f16"
+	require.True(t, runner.needsReload(ctx, req))
+
+	// Unset on new request while loaded runner has a value -> reload
+	// (per-model parameter is explicit; absence is a real change)
+	req.opts.KvCacheType = ""
+	require.True(t, runner.needsReload(ctx, req))
+}
+
+func TestSchedNeedsReloadFlashAttention(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer done()
+
+	ml := &mockLlm{vramByGPU: map[ml.DeviceID]uint64{}}
+	opts := api.DefaultOptions()
+	on := true
+	opts.FlashAttention = &on
+	model := &Model{}
+	runner := &runnerRef{
+		Options:     &opts,
+		llama:       ml,
+		numParallel: 1,
+	}
+	runner.model.Store(model)
+
+	// Same flash_attention -> no reload
+	req := &LlmRequest{model: model, opts: api.DefaultOptions()}
+	req.opts.FlashAttention = &on
+	require.False(t, runner.needsReload(ctx, req))
+
+	// Different flash_attention -> reload
+	off := false
+	req.opts.FlashAttention = &off
+	require.True(t, runner.needsReload(ctx, req))
+
+	// Unset on new request while loaded runner has a value -> reload
+	req.opts.FlashAttention = nil
 	require.True(t, runner.needsReload(ctx, req))
 }
 
@@ -2151,6 +2242,7 @@ type mockLlm struct {
 	totalSize         uint64
 	contextLength     int
 	vramByGPU         map[ml.DeviceID]uint64
+	numCtx            int
 
 	// loadErr, if non-nil, is returned from Load() to simulate a post-spawn
 	// load failure (e.g. llama-server crashing due to under-predicted VRAM).
@@ -2223,6 +2315,7 @@ func (s *mockLlm) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo { return n
 func (s *mockLlm) HasExited() bool                                    { return false }
 func (s *mockLlm) GetActiveDeviceIDs() []ml.DeviceID                  { return nil }
 func (s *mockLlm) ContextLength() int                                 { return s.contextLength }
+func (s *mockLlm) RunnerOptions() map[string]any                      { return map[string]any{"num_ctx": int64(s.numCtx)} }
 
 func TestRunnerCanBeEvicted(t *testing.T) {
 	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)

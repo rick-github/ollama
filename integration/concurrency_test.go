@@ -23,7 +23,7 @@ import (
 func runConcurrentChat(t *testing.T) {
 	// Assumes all requests have the same model
 	req, resp := ChatRequests()
-	numParallel := int(envconfig.NumParallel() + 1)
+	numParallel := envconfig.NumParallel() + 1
 	iterLimit := 3
 
 	softTimeout, hardTimeout := getTimeouts(t)

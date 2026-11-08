@@ -583,6 +583,110 @@ TEMPLATE """
 			},
 			nil,
 		},
+		{
+			`
+FROM foo
+SYSTEM 'hello world'
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: "hello world"},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM '''hello world'''
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: "hello world"},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM '''
+multiline single-quoted
+system
+'''
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: "\nmultiline single-quoted\nsystem\n"},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM ''''''
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: ""},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM ''''hello''''
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: "hello"},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM ''''content with ''' quotes''''
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: "content with ''' quotes"},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM """"content with """ quotes""""
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: `content with """ quotes`},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM """"multi
+line with """
+inside""""
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: "multi\nline with \"\"\"\ninside"},
+			},
+			nil,
+		},
+		{
+			`
+FROM foo
+SYSTEM 'it''s a test'
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "system", Args: "it''s a test"},
+			},
+			nil,
+		},
 	}
 
 	for _, c := range cases {
@@ -721,6 +825,29 @@ MESSAGE assistant Hello, I want to parse all the things!
 FROM foo
 SYSTEM ""
 `,
+		`
+FROM foo
+SYSTEM '''
+A multiline system with """ embedded triple quotes.
+And a line ending with """
+'''
+`,
+		`
+FROM foo
+SYSTEM """"content with """ inside""""
+`,
+		`
+FROM foo
+SYSTEM """""content with """" inside"""""
+`,
+		`
+FROM foo
+SYSTEM '  leading and trailing spaces  '
+`,
+		`
+FROM foo
+SYSTEM '''  multi-line with "double" and 'single' quotes  '''
+`,
 	}
 
 	for _, c := range cases {
@@ -852,6 +979,17 @@ MESSAGE assistant Hi! How are you?
 					{Role: "user", Content: "Hello there!"},
 					{Role: "assistant", Content: "Hi! How are you?"},
 				},
+			},
+		},
+		{
+			`FROM test
+PARAMETER args --image-max-tokens
+PARAMETER args 4096
+PARAMETER args --no-mmproj-offload
+`,
+			&api.CreateRequest{
+				From:       "test",
+				Parameters: map[string]any{"args": []string{"--image-max-tokens", "4096", "--no-mmproj-offload"}},
 			},
 		},
 	}
@@ -1346,6 +1484,122 @@ func TestFilesForModel(t *testing.T) {
 					t.Errorf("Missing expected file: %s", wantFile)
 				}
 			}
+		})
+	}
+}
+
+func TestQuote(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"hello", "hello"},
+		{"  hello  ", `"  hello  "`},
+		{"hello world", "hello world"},
+		{"multi\nline", `"""multi
+line"""`},
+		{`with "quotes"`, `'with "quotes"'`},
+		{`with """triple"""`, `'with """triple"""'`},
+		{`with """"quad""""`, `'with """"quad""""'`},
+		{`single 'quote'`, `"single 'quote'"`},
+		{`  with "double" and 'single'  `, `"""  with "double" and 'single'  """`},
+		{"  multi\nline with \"\"\"  ", `'''  multi
+line with """  '''`},
+		{`'''triple single'''`, `"'''triple single'''"`},
+		{`"starts with quote"`, `'"starts with quote"'`},
+		{`'starts with single'`, `"'starts with single'"`},
+	}
+
+	for _, c := range cases {
+		t.Run("", func(t *testing.T) {
+			assert.Equal(t, c.expected, quote(c.input))
+		})
+	}
+}
+
+func TestUnquote(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+		ok       bool
+	}{
+		{`hello`, "hello", true},
+		{`"hello"`, "hello", true},
+		{`'hello'`, "hello", true},
+		{`""`, "", true},
+		{`''`, "", true},
+		{`"""hello"""`, "hello", true},
+		{`'''hello'''`, "hello", true},
+		{`""""""`, "", true},
+		{`''''''`, "", true},
+		{`""""hello""""`, "hello", true},
+		{`""""content with """ inside""""`, `content with """ inside`, true},
+		{`"""""content with """" inside"""""`, `content with """" inside`, true},
+		{`"""hello`, "", false},
+		{`"hello`, "", false},
+		{`'''hello`, "", false},
+		{`'hello`, "", false},
+		{`""""hello"""`, "", false},
+		{`""hello""`, `"hello"`, true},
+		{`''hello''`, `'hello'`, true},
+	}
+
+	for _, c := range cases {
+		t.Run("", func(t *testing.T) {
+			s, ok := unquote(c.input)
+			assert.Equal(t, c.ok, ok)
+			if ok {
+				assert.Equal(t, c.expected, s)
+			}
+		})
+	}
+}
+
+func TestQuoteUnquoteRoundtrip(t *testing.T) {
+	contents := []string{
+		"hello world",
+		"  leading and trailing  ",
+		"multi\nline\nstring",
+		`with "double quotes"`,
+		`with """triple quotes"""`,
+		`with """"quad quotes""""`,
+		`with 'single quotes'`,
+		`with '''triple single'''`,
+		`mixed "double" and 'single'`,
+		"  multi\nline with " + `"""triple"""` + " and " + `'''single'''` + "  ",
+		`line ending with """` + "\nanother line",
+		`"""""five quotes"""""`,
+	}
+
+	for _, s := range contents {
+		t.Run("", func(t *testing.T) {
+			q := quote(s)
+			u, ok := unquote(strings.TrimSpace(q))
+			require.True(t, ok, "unquote failed for %q -> %q", s, q)
+			assert.Equal(t, s, u, "roundtrip mismatch for %q -> %q -> %q", s, q, u)
+		})
+	}
+}
+
+func TestMaxRun(t *testing.T) {
+	cases := []struct {
+		input    string
+		ch       byte
+		expected int
+	}{
+		{`hello`, '"', 0},
+		{`"hello"`, '"', 1},
+		{`""hello""`, '"', 2},
+		{`"""hello"""`, '"', 3},
+		{`""""hello""""`, '"', 4},
+		{`"a"b"c"`, '"', 1},
+		{`''a''b''`, '\'', 2},
+		{`no quotes here`, '"', 0},
+	}
+
+	for _, c := range cases {
+		t.Run("", func(t *testing.T) {
+			assert.Equal(t, c.expected, maxRun(c.input, c.ch))
 		})
 	}
 }

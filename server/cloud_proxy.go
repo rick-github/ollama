@@ -71,7 +71,7 @@ func init() {
 	}
 }
 
-func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
+func (s *Server) cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Method != http.MethodPost {
 			c.Next()
@@ -121,6 +121,9 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 			return
 		}
 
+		// Store the cloud model name for metrics recording.
+		c.Set("cloudModel", model)
+
 		// Keep server-side web search on the local compatibility middleware path.
 		// The converted model requests use Ollama's /api/chat contract, including
 		// for cloud models; all other cloud compatibility traffic remains raw
@@ -131,12 +134,12 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 			return
 		}
 
-		proxyCloudRequest(c, normalizedBody, disabledOperation)
+		s.proxyCloudRequest(c, normalizedBody, disabledOperation)
 		c.Abort()
 	}
 }
 
-func cloudModelPathPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
+func (s *Server) cloudModelPathPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		modelName := strings.TrimSpace(c.Param("model"))
 		if modelName == "" {
@@ -151,33 +154,40 @@ func cloudModelPathPassthroughMiddleware(disabledOperation string) gin.HandlerFu
 		}
 
 		proxyPath := "/v1/models/" + modelRef.Base
-		proxyCloudRequestWithPath(c, nil, proxyPath, disabledOperation)
+		s.proxyCloudRequestWithPath(c, nil, proxyPath, disabledOperation)
 		c.Abort()
 	}
 }
 
-func proxyCloudJSONRequest(c *gin.Context, payload any, disabledOperation string) {
+func (s *Server) proxyCloudJSONRequest(c *gin.Context, payload any, disabledOperation string) {
 	// TEMP(drifkin): we currently split out this `WithPath` method because we are
 	// mapping `/v1/messages` + web_search to `/api/chat` temporarily. Once we
 	// stop doing this, we can inline this method.
-	proxyCloudJSONRequestWithPath(c, payload, c.Request.URL.Path, disabledOperation)
+	s.proxyCloudJSONRequestWithPath(c, payload, c.Request.URL.Path, disabledOperation)
 }
 
-func proxyCloudJSONRequestWithPath(c *gin.Context, payload any, path string, disabledOperation string) {
+func (s *Server) proxyCloudJSONRequestWithPath(c *gin.Context, payload any, path string, disabledOperation string) {
 	body, err := marshalNoHTMLEscape(payload)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	proxyCloudRequestWithPath(c, body, path, disabledOperation)
+	s.proxyCloudRequestWithPath(c, body, path, disabledOperation)
 }
 
-func proxyCloudRequest(c *gin.Context, body []byte, disabledOperation string) {
-	proxyCloudRequestWithPath(c, body, c.Request.URL.Path, disabledOperation)
+func (s *Server) proxyCloudRequest(c *gin.Context, body []byte, disabledOperation string) {
+	s.proxyCloudRequestWithPath(c, body, c.Request.URL.Path, disabledOperation)
 }
 
-func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disabledOperation string) {
+func (s *Server) proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disabledOperation string) {
+	var mctx cloudProxyMetricsCtx
+	mctx.cloudRequestStart = time.Now()
+
+	if s.sched != nil {
+		defer s.recordCloudProxyMetrics(c, path, &mctx)
+	}
+
 	if disabled, _ := internalcloud.Status(); disabled {
 		c.JSON(http.StatusForbidden, gin.H{"error": internalcloud.DisabledError(disabledOperation)})
 		return
@@ -230,6 +240,12 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	}
 	defer resp.Body.Close()
 
+	if cloudReqID := resp.Header.Get("x-request-id"); cloudReqID != "" {
+		c.Set("cloud_request_id", cloudReqID)
+	}
+	mctx.cloudBuildCommit = resp.Header.Get("x-build-commit")
+	mctx.cloudBuildTime = resp.Header.Get("x-build-time")
+
 	if transformChat {
 		// The compatibility writer owns the downstream representation headers.
 		resp.Header.Del("Content-Type")
@@ -245,15 +261,26 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	}
 	c.Status(resp.StatusCode)
 
+	// Wrap the body writer to capture the final JSON object for metrics.
+	// Only capture for inference endpoints that return done responses.
+	var bodyWriter http.ResponseWriter = c.Writer
+	if s.sched != nil && resp.StatusCode == http.StatusOK {
+		switch routeToAction(path) {
+		case "chat", "completions", "messages", "responses", "generate":
+			mctx.metricsCapturer = newCloudMetricsCapturer(bodyWriter, mctx.cloudRequestStart)
+			bodyWriter = mctx.metricsCapturer
+		}
+	}
+
 	if transformChat && resp.StatusCode == http.StatusOK {
 		var request struct {
 			Stream *bool `json:"stream"`
 		}
 		if err = json.Unmarshal(body, &request); err == nil {
-			err = copyCloudChatResponse(c.Writer, resp.Body, request.Stream == nil || *request.Stream)
+			err = copyCloudChatResponse(bodyWriter, resp.Body, request.Stream == nil || *request.Stream)
 		}
 	} else {
-		err = copyProxyResponseBody(c.Writer, resp.Body)
+		err = copyProxyResponseBody(bodyWriter, resp.Body)
 	}
 	if err != nil {
 		ctxErr := c.Request.Context().Err()
@@ -540,6 +567,55 @@ func copyProxyResponseBody(dst http.ResponseWriter, src io.Reader) error {
 			if err == io.EOF {
 				return nil
 			}
+			return err
+		}
+	}
+}
+
+type jsonlFramingResponseWriter struct {
+	http.ResponseWriter
+	pending []byte
+}
+
+func (w *jsonlFramingResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *jsonlFramingResponseWriter) Write(p []byte) (int, error) {
+	w.pending = append(w.pending, p...)
+	if err := w.flushCompleteLines(); err != nil {
+		return len(p), err
+	}
+	return len(p), nil
+}
+
+func (w *jsonlFramingResponseWriter) FlushPending() error {
+	trailing := bytes.TrimSpace(w.pending)
+	w.pending = nil
+	if len(trailing) == 0 {
+		return nil
+	}
+
+	_, err := w.ResponseWriter.Write(trailing)
+	return err
+}
+
+func (w *jsonlFramingResponseWriter) flushCompleteLines() error {
+	for {
+		newline := bytes.IndexByte(w.pending, '\n')
+		if newline < 0 {
+			return nil
+		}
+
+		line := bytes.TrimSpace(w.pending[:newline])
+		w.pending = w.pending[newline+1:]
+		if len(line) == 0 {
+			continue
+		}
+
+		if _, err := w.ResponseWriter.Write(line); err != nil {
 			return err
 		}
 	}

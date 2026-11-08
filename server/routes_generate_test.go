@@ -75,6 +75,16 @@ func (m *mockRunner) Completion(ctx context.Context, r llm.CompletionRequest, fn
 	return nil
 }
 
+func (m *mockRunner) MemorySize() (uint64, uint64) {
+	if m == nil {
+		return 0, 0
+	}
+	if m.LlamaServer == nil {
+		return 0, 0
+	}
+	return m.LlamaServer.MemorySize()
+}
+
 func (m *mockRunner) Chat(ctx context.Context, r llm.ChatRequest, fn func(llm.ChatResponse)) error {
 	m.ChatRequest = r
 	if m.ChatFn != nil {
@@ -110,6 +120,10 @@ func (mockRunner) Tokenize(_ context.Context, s string) (tokens []int, err error
 func (mockRunner) Ping(_ context.Context) error { return nil }
 
 func (m mockRunner) ContextLength() int { return m.contextLength }
+
+func (m mockRunner) RunnerOptions() map[string]any {
+	return map[string]any{"num_ctx": int64(m.contextLength)}
+}
 
 func TestLlamaServerConfigForModelSplitPaths(t *testing.T) {
 	m := &Model{
@@ -175,6 +189,7 @@ func newServerWithMockRunner(t *testing.T, mock *mockRunner) *Server {
 			expiredCh:       make(chan *runnerRef, 1),
 			unloadedCh:      make(chan any, 1),
 			loaded:          make(map[string]*runnerRef),
+			pendingModels:   make(map[string]int),
 			newServerFn:     newMockServer(mock),
 			getGpuFn:        getGpuFn,
 			getSystemInfoFn: getSystemInfoFn,

@@ -1004,6 +1004,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		err = c.Chat(ctx, chatReq, func(res api.ChatResponse) error {
+			if res.Message.Content == "" && res.Message.Thinking == "" && len(res.Message.ToolCalls) == 0 && !res.Done {
+				return nil
+			}
+
 			if loading {
 				// Remove the loading indicator on first token
 				cancelLoading()
@@ -1015,10 +1019,6 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) error {
 				now := time.Now()
 				thinkingTimeStart = &now
 				thinkingTimeEnd = nil
-			}
-
-			if res.Message.Content == "" && res.Message.Thinking == "" && len(res.Message.ToolCalls) == 0 {
-				return nil
 			}
 
 			event := EventChat

@@ -74,10 +74,12 @@ type LlamaServer interface {
 	GetDeviceInfos(ctx context.Context) []ml.DeviceInfo
 	HasExited() bool
 	ContextLength() int
+	RunnerOptions() map[string]any
 }
 
 type LlamaServerConfig struct {
 	DisableJinja         bool
+	ChatTemplate         string
 	ContextShift         bool
 	EnableMTP            bool
 	ManifestDigest       string
@@ -113,8 +115,21 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		opts.NumCtx = int(trainCtx)
 	}
 
-	kvct := strings.ToLower(envconfig.KvCacheType())
+	kvct := resolveKvCacheType(opts.KvCacheType)
 	return NewLlamaServerRunner(gpus, modelPath, f, adapters, projectors, opts, numParallel, kvct, config)
+}
+
+// resolveKvCacheType picks the K/V cache quantization type to pass to
+// llama-server. A non-empty per-model value (set via the kv_cache_type
+// PARAMETER) takes precedence over the OLLAMA_KV_CACHE_TYPE env var. The
+// value may be a single type (e.g. "q8_0") applied to both K and V, or a
+// comma-separated pair "k,v" (e.g. "q8_0,f16") where the first element
+// is used for --cache-type-k and the second for --cache-type-v.
+func resolveKvCacheType(perModel string) string {
+	if perModel = strings.ToLower(strings.TrimSpace(perModel)); perModel != "" {
+		return perModel
+	}
+	return strings.ToLower(envconfig.KvCacheType())
 }
 
 // Server status types
@@ -206,6 +221,7 @@ type CompletionRequest struct {
 	Format  json.RawMessage
 	Media   []MediaData
 	Options *api.Options
+	Think   *api.ThinkValue
 
 	Shift           bool
 	Truncate        bool

@@ -65,7 +65,7 @@ func (s *Server) SpeechHandler(c *gin.Context) {
 		return
 	}
 
-	r, m, _, err := s.scheduleRunner(c.Request.Context(), req.Model, "", []model.Capability{model.CapabilitySpeech}, nil, nil, nil)
+	r, m, _, err := s.scheduleRunner(c.Request.Context(), req.Model, "", []model.Capability{model.CapabilitySpeech}, nil, nil, nil, metricsAuthToken(c))
 	speaker, ok := r.(llm.Speaker)
 	switch {
 	case errors.Is(err, errCapabilities), err == nil && !ok:

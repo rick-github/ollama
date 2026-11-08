@@ -1,0 +1,524 @@
+{
+  "title": "Ollama Overview",
+  "uid": "ollama-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "tags": ["ollama"],
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "auth",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(ollama_requests_completed_total, auth)",
+        "refresh": 2,
+        "includeAll": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(ollama_requests_completed_total, model)",
+        "refresh": 2,
+        "includeAll": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(ollama_requests_completed_total[$__rate_interval]))", "legendFormat": "total" },
+        { "expr": "sum by (action) (rate(ollama_requests_completed_total[$__rate_interval]))", "legendFormat": "{{action}}" },
+        { "expr": "sum by (model) (rate(ollama_requests_completed_total[$__rate_interval]))", "legendFormat": "{{model}}", "hide": true }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Errors / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        { "expr": "sum(rate(ollama_request_errors_total[$__rate_interval]))", "legendFormat": "total" },
+        { "expr": "sum by (error_type) (rate(ollama_request_errors_total[$__rate_interval]))", "legendFormat": "{{error_type}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Error Ratio",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "yellow", "value": 0.05 }, { "color": "red", "value": 0.1 }] } } },
+      "targets": [
+        { "expr": "sum(rate(ollama_request_errors_total[5m])) / clamp_min(sum(rate(http_requests_total[5m])), 1)", "legendFormat": "error ratio" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Uptime",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "ollama_uptime_seconds", "legendFormat": "uptime" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Models Loaded",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "ollama_models_loaded", "legendFormat": "loaded" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "ollama_requests_queued", "legendFormat": "queued" },
+        { "expr": "ollama_queue_capacity", "legendFormat": "capacity" }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Tokens / sec (generated)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "cps" } },
+      "targets": [
+        { "expr": "sum by (model) (rate(ollama_eval_total[$__rate_interval]))", "legendFormat": "{{model}}" }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Tokens / sec (prompt eval)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "cps" } },
+      "targets": [
+        { "expr": "sum by (model) (rate(ollama_prompt_eval_total[$__rate_interval]) - rate(ollama_prompt_eval_cached_total[$__rate_interval]))", "legendFormat": "eval {{model}}" },
+        { "expr": "sum by (model) (rate(ollama_prompt_eval_cached_total[$__rate_interval]))", "legendFormat": "cached {{model}}", "hide": true }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Request Duration Breakdown",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "rate(ollama_total_duration_seconds[$__rate_interval]) / rate(ollama_eval_total[$__rate_interval]) * 0 + rate(ollama_total_duration_seconds[$__rate_interval])", "legendFormat": "total {{model}}", "hide": false },
+        { "expr": "rate(ollama_load_duration_seconds[$__rate_interval])", "legendFormat": "load {{model}}" },
+        { "expr": "rate(ollama_prompt_eval_duration_seconds[$__rate_interval])", "legendFormat": "prompt eval {{model}}", "hide": true },
+        { "expr": "rate(ollama_eval_duration_seconds[$__rate_interval])", "legendFormat": "eval {{model}}", "hide": true }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "GPU Memory",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "ollama_gpu_memory_total_bytes", "legendFormat": "total {{gpu_id}}" },
+        { "expr": "ollama_gpu_memory_free_bytes", "legendFormat": "free {{gpu_id}}" },
+        { "expr": "ollama_peak_memory_bytes", "legendFormat": "peak {{model}}" }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "Requests / sec by User",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum by (auth) (rate(ollama_requests_completed_total[$__rate_interval]))", "legendFormat": "{{auth}}" }
+      ]
+    },
+    {
+      "id": 32,
+      "title": "Requests / sec by Model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum by (model) (rate(ollama_requests_completed_total[$__rate_interval]))", "legendFormat": "{{model}}" }
+      ]
+    },
+    {
+      "id": 33,
+      "title": "Local vs Cloud Requests / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(ollama_cloud_requests_total[$__rate_interval]))", "legendFormat": "cloud" },
+        { "expr": "sum(rate(ollama_requests_completed_total[$__rate_interval])) - sum(rate(ollama_cloud_requests_total[$__rate_interval]))", "legendFormat": "local" }
+      ]
+    },
+    {
+      "id": 34,
+      "title": "Cloud Requests / sec by Model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum by (model) (rate(ollama_cloud_requests_total[$__rate_interval]))", "legendFormat": "cloud {{model}}" }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Tokens / sec by User",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "cps" } },
+      "targets": [
+        { "expr": "sum by (auth) (rate(ollama_eval_total[$__rate_interval]))", "legendFormat": "{{auth}}" }
+      ]
+    },
+    {
+      "id": 40,
+      "title": "Model Load / Unload Events",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(ollama_model_load_total[$__rate_interval])", "legendFormat": "load {{model}}" },
+        { "expr": "rate(ollama_model_unload_total[$__rate_interval])", "legendFormat": "unload {{model}}" }
+      ]
+    },
+    {
+      "id": 41,
+      "title": "Context Length by Model",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "ollama_context_length", "legendFormat": "{{model}} (np={{num_parallel}})" }
+      ]
+    },
+    {
+      "id": 50,
+      "title": "GPU VRAM Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "ollama_gpu_memory_total_bytes", "legendFormat": "total {{gpu_id}} {{library}}" },
+        { "expr": "ollama_gpu_memory_free_bytes", "legendFormat": "free {{gpu_id}} {{library}}" },
+        { "expr": "ollama_gpu_memory_total_bytes - ollama_gpu_memory_free_bytes", "legendFormat": "used {{gpu_id}} {{library}}" }
+      ]
+    },
+    {
+      "id": 51,
+      "title": "System Memory",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "ollama_system_memory_total_bytes", "legendFormat": "total" },
+        { "expr": "ollama_system_memory_free_bytes", "legendFormat": "free" },
+        { "expr": "ollama_system_memory_total_bytes - ollama_system_memory_free_bytes", "legendFormat": "used" },
+        { "expr": "ollama_system_swap_free_bytes", "legendFormat": "swap free" }
+      ]
+    },
+    {
+      "id": 60,
+      "title": "Time to First Token (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le, model) (rate(ollama_time_to_first_token_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{model}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, model) (rate(ollama_time_to_first_token_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{model}}" },
+        { "expr": "histogram_quantile(0.99, sum by (le, model) (rate(ollama_time_to_first_token_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{model}}" }
+      ]
+    },
+    {
+      "id": 70,
+      "title": "Cloud Usage Total Cost",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 72 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyusd" } },
+      "targets": [
+        { "expr": "ollama_cloud_usage_total_cost{range=\"7d\"}", "legendFormat": "{{range}}" }
+      ]
+    },
+    {
+      "id": 71,
+      "title": "Cloud Usage Requests by Model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 72 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "ollama_cloud_usage_total_requests{range=\"7d\"}", "legendFormat": "total" },
+        { "expr": "ollama_cloud_usage_requests{range=\"7d\"}", "legendFormat": "{{model}}" }
+      ]
+    },
+    {
+      "id": 72,
+      "title": "Cloud Usage Cost by Model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 80 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyusd" } },
+      "targets": [
+        { "expr": "ollama_cloud_usage_cost", "legendFormat": "{{model}}" }
+      ]
+    },
+    {
+      "id": 73,
+      "title": "Cloud Cost per Token by Model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 88 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "sci" } },
+      "targets": [
+        { "expr": "ollama_cloud_cost_per_prompt_token", "legendFormat": "prompt {{model}}" },
+        { "expr": "ollama_cloud_cost_per_eval_token", "legendFormat": "eval {{model}}" },
+        { "expr": "ollama_cloud_cost_per_token", "legendFormat": "combined {{model}}", "hide": true }
+      ]
+    },
+    {
+      "id": 74,
+      "title": "Cloud Usage Tokens by Model (API-reported)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 96 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "ollama_cloud_usage_input_tokens", "legendFormat": "input {{model}}" },
+        { "expr": "ollama_cloud_usage_cached_input_tokens", "legendFormat": "cached {{model}}" },
+        { "expr": "ollama_cloud_usage_output_tokens", "legendFormat": "output {{model}}" }
+      ]
+    },
+    {
+      "id": 80,
+      "title": "Estimated Cloud Cost (from pricing data)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 96 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "targets": [
+        {
+          "expr": "(increase(ollama_cloud_prompt_tokens[$__rate_interval]) - increase(ollama_cloud_cached_prompt_tokens[$__rate_interval])) / 1e6 * on(model) group_left ollama_cloud_current_token_price{token_type=\"prompt\"}",
+          "legendFormat": "prompt {{model}}",
+          "hide": false
+        },
+        {
+          "expr": "increase(ollama_cloud_cached_prompt_tokens[$__rate_interval]) / 1e6 * on(model) group_left ollama_cloud_current_token_price{token_type=\"cached_prompt\"}",
+          "legendFormat": "cached {{model}}",
+          "hide": false
+        },
+        {
+          "expr": "increase(ollama_cloud_eval_tokens[$__rate_interval]) / 1e6 * on(model) group_left ollama_cloud_current_token_price{token_type=\"eval\"}",
+          "legendFormat": "eval {{model}}",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 90,
+      "title": "Cloud Build Info",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 104 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "ollama_cloud_build_info",
+          "legendFormat": "{{model}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "Value": true },
+            "renameByName": { "commit": "Commit", "build_time": "Build Time", "model": "Model" }
+          }
+        }
+      ]
+    },
+    {
+      "id": 100,
+      "title": "Cloud Balance (USD)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 112 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyusd" } },
+      "targets": [
+        { "expr": "ollama_cloud_included_balance_usd", "legendFormat": "included (remaining)" },
+        { "expr": "ollama_cloud_included_allowance_usd", "legendFormat": "included (allowance)" },
+        { "expr": "ollama_cloud_purchased_balance_usd", "legendFormat": "purchased" }
+      ]
+    },
+    {
+      "id": 101,
+      "title": "Cloud Balance Remaining % (Legacy)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 112 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 } },
+      "targets": [
+        { "expr": "ollama_cloud_session_remaining_percent", "legendFormat": "session" },
+        { "expr": "ollama_cloud_weekly_remaining_percent", "legendFormat": "weekly" }
+      ]
+    },
+    {
+      "id": 102,
+      "title": "Cloud Balance Cost by Model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 120 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyusd" } },
+      "targets": [
+        { "expr": "ollama_cloud_balance_cost", "legendFormat": "{{model}}" }
+      ]
+    },
+    {
+      "id": 103,
+      "title": "Cloud Usage Consumed by Model (Legacy)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 120 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "ollama_cloud_session_usage_consumed", "legendFormat": "session {{model}}" },
+        { "expr": "ollama_cloud_weekly_usage_consumed", "legendFormat": "weekly {{model}}" }
+      ]
+    },
+    {
+      "id": 110,
+      "title": "HTTP Requests / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 128 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(http_requests_total[$__rate_interval]))", "legendFormat": "total" },
+        { "expr": "sum by (action) (rate(http_requests_total[$__rate_interval]))", "legendFormat": "{{action}}" },
+        { "expr": "sum by (status) (rate(http_requests_total[$__rate_interval]))", "legendFormat": "{{status}}", "hide": true }
+      ]
+    },
+    {
+      "id": 111,
+      "title": "HTTP Requests / sec by Status Code",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 128 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum by (status_code) (rate(http_requests_total[$__rate_interval]))", "legendFormat": "{{status_code}}" }
+      ]
+    },
+    {
+      "id": 120,
+      "title": "Runner Parameters by Model",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 136 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "ollama_runner_num_batch", "legendFormat": "batch {{model}}" },
+        { "expr": "ollama_runner_num_gpu", "legendFormat": "gpu layers {{model}}" },
+        { "expr": "ollama_runner_num_thread", "legendFormat": "threads {{model}}" },
+        { "expr": "ollama_runner_train_context", "legendFormat": "train ctx {{model}}" }
+      ]
+    },
+    {
+      "id": 121,
+      "title": "Runner Model Size by Model",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 136 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        { "expr": "ollama_runner_total_size_bytes", "legendFormat": "total {{model}}" },
+        { "expr": "ollama_runner_vram_size_bytes", "legendFormat": "vram {{model}}" }
+      ]
+    },
+    {
+      "id": 122,
+      "title": "Runner Flags by Model",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 144 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "min": -1, "max": 1 } },
+      "targets": [
+        { "expr": "ollama_runner_use_mmap", "legendFormat": "mmap {{model}}" },
+        { "expr": "ollama_runner_num_ctx_auto", "legendFormat": "ctx auto {{model}}" },
+        { "expr": "ollama_runner_context_shift", "legendFormat": "ctx shift {{model}}" }
+      ]
+    },
+    {
+      "id": 123,
+      "title": "Runner Backend Info",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 144 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "ollama_runner_info",
+          "legendFormat": "{{model}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "Value": true },
+            "renameByName": { "model": "Model", "runner": "Runner" }
+          }
+        }
+      ]
+    },
+    {
+      "id": 130,
+      "title": "Queue Depth by Model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 152 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "ollama_requests_queued_by_model", "legendFormat": "{{model}}" }
+      ]
+    }
+  ]
+}

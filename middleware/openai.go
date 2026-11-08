@@ -78,6 +78,33 @@ func (w *BaseWriter) writeError(data []byte) (int, error) {
 	return len(data), nil
 }
 
+// isHeartbeat returns true if data is a keepalive chunk ({"done":false})
+// sent by the server to prevent client idle timeouts. Streaming writers
+// should call this before their normal conversion logic and write an SSE
+// comment to keep the connection alive without producing a data event.
+func isHeartbeat(data []byte) bool {
+	var r struct {
+		Done       bool            `json:"done"`
+		Model      json.RawMessage `json:"model,omitempty"`
+		Content    json.RawMessage `json:"content,omitempty"`
+		Message    json.RawMessage `json:"message,omitempty"`
+		DoneReason json.RawMessage `json:"done_reason,omitempty"`
+		Error      json.RawMessage `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return false
+	}
+	return !r.Done && len(r.Model) == 0 && len(r.Content) == 0 && len(r.Message) == 0 && len(r.DoneReason) == 0 && len(r.Error) == 0
+}
+
+// writeSSEHeartbeat writes an SSE comment frame (":\n\n") that
+// keeps the connection alive without producing a data event. SSE
+// comment frames are ignored by all compliant SSE clients.
+func (w *BaseWriter) writeSSEHeartbeat() (int, error) {
+	w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+	return w.ResponseWriter.Write([]byte(":\n\n"))
+}
+
 func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 	var chatResponse api.ChatResponse
 	err := json.Unmarshal(data, &chatResponse)
@@ -180,7 +207,9 @@ func (w *ChatWriter) Write(data []byte) (int, error) {
 	if code != http.StatusOK {
 		return w.writeError(data)
 	}
-
+	if w.stream && isHeartbeat(data) {
+		return w.writeSSEHeartbeat()
+	}
 	return w.writeResponse(data)
 }
 
@@ -247,7 +276,9 @@ func (w *CompleteWriter) Write(data []byte) (int, error) {
 	if code != http.StatusOK {
 		return w.writeError(data)
 	}
-
+	if w.stream && isHeartbeat(data) {
+		return w.writeSSEHeartbeat()
+	}
 	return w.writeResponse(data)
 }
 
@@ -579,6 +610,9 @@ func (w *ResponsesWriter) Write(data []byte) (int, error) {
 	if code != http.StatusOK {
 		return w.writeError(data)
 	}
+	if w.stream && isHeartbeat(data) {
+		return w.writeSSEHeartbeat()
+	}
 	return w.writeResponse(data)
 }
 
@@ -644,6 +678,9 @@ func (w *WebSearchResponsesWriter) Write(data []byte) (int, error) {
 	}
 	if w.Status() != http.StatusOK {
 		return len(data), w.writeWebSearchError(decodeWebSearchResponseError(w.Status(), data), api.Metrics{})
+	}
+	if w.inner.stream && isHeartbeat(data) {
+		return w.writeSSEHeartbeat()
 	}
 	if w.inner.stream {
 		if _, ok := streamErrorMessage(data); ok {

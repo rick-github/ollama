@@ -129,6 +129,7 @@ type ChatCompletionRequest struct {
 	DebugRenderOnly  bool            `json:"_debug_render_only"`
 	// Ollama extension: without it an OpenAI-API client cannot release a model.
 	KeepAlive *api.Duration `json:"keep_alive,omitempty"`
+	Args      []string      `json:"args,omitempty"`
 }
 
 // Timings reports server-side inference performance metrics.
@@ -182,6 +183,7 @@ type CompletionRequest struct {
 	Suffix           string         `json:"suffix"`
 	Logprobs         *int           `json:"logprobs"`
 	DebugRenderOnly  bool           `json:"_debug_render_only"`
+	Args             []string       `json:"args,omitempty"`
 }
 
 type Completion struct {
@@ -774,6 +776,10 @@ func FromChatRequest(r ChatCompletionRequest, thinking ...*model.Thinking) (*api
 		options["top_p"] = *r.TopP
 	}
 
+	if len(r.Args) > 0 {
+		options["args"] = r.Args
+	}
+
 	var format json.RawMessage
 	if r.ResponseFormat != nil {
 		switch strings.ToLower(strings.TrimSpace(r.ResponseFormat.Type)) {
@@ -918,6 +924,10 @@ func FromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 
 	if r.TopP != nil {
 		options["top_p"] = *r.TopP
+	}
+
+	if len(r.Args) > 0 {
+		options["args"] = r.Args
 	}
 
 	var logprobs bool
